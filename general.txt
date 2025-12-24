@@ -1,0 +1,8 @@
+check C compiler in vs code:
+gcc --version
+
+compile:
+gcc -o sim.exe sim.c -std=c99 -Wall
+
+run:
+./sim.exe
