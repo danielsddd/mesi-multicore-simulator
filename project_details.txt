@@ -1,10 +1,10 @@
 ================================================================================
-              MULTI-CORE MESI SIMULATOR - DETAILED WORK PLAN
-              Tel Aviv University - Computer Architecture Project
+              MULTI-CORE MESI SIMULATOR - COMPREHENSIVE SPECIFICATION
+              Tel Aviv University - Computer Architecture (0512.4461)
 ================================================================================
 
 ================================================================================
-SECTION 1: ARCHITECTURE OVERVIEW (FROM ASSIGNMENT)
+SECTION 1: ARCHITECTURE OVERVIEW
 ================================================================================
 
 The simulator implements:
@@ -35,7 +35,7 @@ CRITICAL DIFFERENCES FROM STANDARD MIPS:
 1. NO BYPASSING/FORWARDING - Data hazards resolved by STALL only
 2. NO half clock cycles for register file access - uses FULL clock cycle
 3. Branch resolution happens in DECODE stage (not Execute)
-4. Delay slot IS used
+4. Delay slot IS used (instruction after branch ALWAYS executes)
 5. Register 1 ($imm) is special - contains sign-extended immediate, updated each decode
 6. Register 0 is hardwired to 0, writes are ignored
 7. PC is 10 bits (not 32), increments by 1 (not 4)
@@ -95,8 +95,9 @@ Pipeline Features:
 - Branch resolution: DECODE stage
 
 STALL BEHAVIOR:
-- Data hazard stall: Instruction waits in DECODE, IF also stalls
+- Data hazard stall: Instruction waits in DECODE, FETCH also stalls
 - Memory stall: Instruction waits in MEM, all earlier stages stall
+- Later stages (e.g., WB) continue if they have valid instructions
 
 -----------------------------------------------------------------------------
 3.4 DATA CACHE (PER CORE)
@@ -166,46 +167,83 @@ bus_shared      1 bit   Set to 1 by snooping cache if it has the block
                         Used to determine Exclusive vs Shared on BusRd
 
 ================================================================================
-SECTION 4: INSTRUCTION SET
+SECTION 4: INSTRUCTION SET ARCHITECTURE (ISA)
 ================================================================================
 
-Instruction Format (32 bits):
-Bits [31:24] = Opcode (8 bits)
-Bits [23:20] = rd (4 bits)
-Bits [19:16] = rs (4 bits)
-Bits [15:12] = rt (4 bits)
-Bits [11:0]  = immediate (12 bits, sign-extended to 32 bits)
+-----------------------------------------------------------------------------
+4.1 INSTRUCTION FORMAT (32 bits)
+-----------------------------------------------------------------------------
+  31      24 23    20 19    16 15    12 11              0
+ +----------+--------+--------+--------+------------------+
+ |  Opcode  |   rd   |   rs   |   rt   |    immediate     |
+ +----------+--------+--------+--------+------------------+
+     8 bits   4 bits   4 bits   4 bits      12 bits
+
+- Opcode: bits [31:24] (8 bits)
+- rd: bits [23:20] (4 bits) - destination register
+- rs: bits [19:16] (4 bits) - source register 1
+- rt: bits [15:12] (4 bits) - source register 2
+- immediate: bits [11:0] (12 bits, sign-extended to 32 bits)
 
 -----------------------------------------------------------------------------
-OPCODE TABLE
+4.2 ASSEMBLY SYNTAX
 -----------------------------------------------------------------------------
-Op  Name    Operation                                       Notes
---  ----    ---------                                       -----
-0   add     R[rd] = R[rs] + R[rt]
-1   sub     R[rd] = R[rs] - R[rt]
-2   and     R[rd] = R[rs] & R[rt]
-3   or      R[rd] = R[rs] | R[rt]
-4   xor     R[rd] = R[rs] ^ R[rt]
-5   mul     R[rd] = R[rs] * R[rt]                          32-bit result
-6   sll     R[rd] = R[rs] << R[rt]                         Logical left
-7   sra     R[rd] = R[rs] >> R[rt]                         Arithmetic right (sign extend)
-8   srl     R[rd] = R[rs] >> R[rt]                         Logical right
-9   beq     if (R[rs] == R[rt]) pc = R[rd][9:0]           Branch equal
-10  bne     if (R[rs] != R[rt]) pc = R[rd][9:0]           Branch not equal
-11  blt     if (R[rs] < R[rt]) pc = R[rd][9:0]            Branch less than (SIGNED)
-12  bgt     if (R[rs] > R[rt]) pc = R[rd][9:0]            Branch greater than (SIGNED)
-13  ble     if (R[rs] <= R[rt]) pc = R[rd][9:0]           Branch less or equal (SIGNED)
-14  bge     if (R[rs] >= R[rt]) pc = R[rd][9:0]           Branch greater or equal (SIGNED)
-15  jal     R[15] = next_pc, pc = R[rd][9:0]              Jump and link
-16  lw      R[rd] = MEM[R[rs] + R[rt]]                    Load word
-17  sw      MEM[R[rs] + R[rt]] = R[rd]                    Store word
-20  halt    Halt this core                                 Core stops execution
+General format:
+    opcode $rd, $rs, $rt, immediate
+
+Register names:
+- $r0 through $r15, or $zero, $imm (for R0 and R1 respectively)
+- R1 ($imm) always contains sign-extended immediate value
+
+Examples:
+    add $r2, $r2, $imm, 1        # R2 = R2 + R1 (where R1=1)
+    lw $r3, $zero, $imm, 15     # R3 = MEM[R0 + R1] = MEM[15]
+    blt $zero, $r2, $imm, 100   # if (R2 < R1) PC = R0[9:0] (branch target = 0)
+
+-----------------------------------------------------------------------------
+4.3 OPCODE TABLE
+-----------------------------------------------------------------------------
+Op  Hex   Name    Operation                               Notes
+--  ---   ----    ---------                               -----
+0   0x00  add     R[rd] = R[rs] + R[rt]
+1   0x01  sub     R[rd] = R[rs] - R[rt]
+2   0x02  and     R[rd] = R[rs] & R[rt]
+3   0x03  or      R[rd] = R[rs] | R[rt]
+4   0x04  xor     R[rd] = R[rs] ^ R[rt]
+5   0x05  mul     R[rd] = R[rs] * R[rt]                   32-bit result
+6   0x06  sll     R[rd] = R[rs] << R[rt]                  Logical left
+7   0x07  sra     R[rd] = R[rs] >> R[rt]                  Arithmetic right
+8   0x08  srl     R[rd] = R[rs] >> R[rt]                  Logical right
+9   0x09  beq     if (R[rs] == R[rt]) PC = R[rd][9:0]     Branch equal
+10  0x0A  bne     if (R[rs] != R[rt]) PC = R[rd][9:0]     Branch not equal
+11  0x0B  blt     if (R[rs] < R[rt]) PC = R[rd][9:0]      Branch less (SIGNED)
+12  0x0C  bgt     if (R[rs] > R[rt]) PC = R[rd][9:0]      Branch greater (SIGNED)
+13  0x0D  ble     if (R[rs] <= R[rt]) PC = R[rd][9:0]     Branch less/equal (SIGNED)
+14  0x0E  bge     if (R[rs] >= R[rt]) PC = R[rd][9:0]     Branch greater/equal (SIGNED)
+15  0x0F  jal     R[15] = PC+1, PC = R[rd][9:0]           Jump and link
+16  0x10  lw      R[rd] = MEM[R[rs] + R[rt]]              Load word
+17  0x11  sw      MEM[R[rs] + R[rt]] = R[rd]              Store word
+20  0x14  halt    Halt this core                          Core stops execution
 
 IMPORTANT NOTES:
 - Branch target comes from R[rd], only lower 10 bits used
-- Comparison in branches is SIGNED
-- jal saves return address in R[15] specifically
-- Address calculation: R[rs] + R[rt] (not rs + immediate!)
+- Comparison in branches is SIGNED (for blt, bgt, ble, bge)
+- jal saves return address (PC+1) in R[15] specifically
+- Address calculation for lw/sw: R[rs] + R[rt] (not rs + immediate!)
+
+-----------------------------------------------------------------------------
+4.4 VERIFIED ENCODING EXAMPLES (from example files)
+-----------------------------------------------------------------------------
+Assembly:                           Hex:        Breakdown:
+add $r2, $r2, $imm, 1               00221001    op=00 rd=2 rs=2 rt=1 imm=001
+add $r3, $r3, $imm, 1               00331001    op=00 rd=3 rs=3 rt=1 imm=001
+blt $zero, $r2, $imm, 100           0B021064    op=0B rd=0 rs=2 rt=1 imm=064
+blt $zero, $r3, $imm, 100           0B031064    op=0B rd=0 rs=3 rt=1 imm=064
+blt $zero, $r2, $imm, 200           0B0210C8    op=0B rd=0 rs=2 rt=1 imm=0C8
+lw $r3, $zero, $imm, 15             1030100F    op=10 rd=3 rs=0 rt=1 imm=00F
+lw $r2, $zero, $imm, 17             10201011    op=10 rd=2 rs=0 rt=1 imm=011
+sw $r2, $zero, $imm, 17             11201011    op=11 rd=2 rs=0 rt=1 imm=011
+halt $zero, $zero, $zero, 0         14000000    op=14 rd=0 rs=0 rt=0 imm=000
 
 ================================================================================
 SECTION 5: BUS PROTOCOL BEHAVIOR
@@ -215,7 +253,8 @@ SECTION 5: BUS PROTOCOL BEHAVIOR
 5.1 ARBITRATION
 -----------------------------------------------------------------------------
 - Method: Round-Robin
-- Rule: Last core that received bus access has LOWEST priority
+- Rule: Last core that received bus access has LOWEST priority next time
+- Initial state: Core 3 is considered "last granted" (so Core 0 has highest priority initially)
 - Condition: Bus must not be busy with ongoing transaction
 - Condition: Previous BusRd/BusRdX must be completed by Flush before new grant
 
@@ -235,7 +274,7 @@ SECTION 5: BUS PROTOCOL BEHAVIOR
    - Shared if bus_shared = 1
 
 -----------------------------------------------------------------------------
-5.3 BusRdX TRANSACTION (Read for Store - Cache Miss)
+5.3 BusRdX TRANSACTION (Read for Store - Cache Miss or Upgrade)
 -----------------------------------------------------------------------------
 1. Core issues BusRdX with address on bus
 2. All other caches:
@@ -244,6 +283,9 @@ SECTION 5: BUS PROTOCOL BEHAVIOR
 3. Response same as BusRd
 4. Requesting cache sets state to: Modified (will write)
 
+Note: BusRdX is also used when cache has Shared state and wants to write
+(needs exclusive access).
+
 -----------------------------------------------------------------------------
 5.4 FLUSH TRANSACTION
 -----------------------------------------------------------------------------
@@ -251,6 +293,7 @@ SECTION 5: BUS PROTOCOL BEHAVIOR
 - Originator can be: Core (if it had Modified) or Main Memory
 - Sends 8 words in 8 consecutive cycles
 - First word at cycle N, last word at cycle N+7
+- When core flushes, main memory updates simultaneously
 
 -----------------------------------------------------------------------------
 5.5 SNOOPING BEHAVIOR
@@ -283,7 +326,7 @@ Detection: In DECODE stage, check if source registers match destination of:
 
 Resolution: STALL the instruction in DECODE
 - FETCH stage also stalls (stops fetching new instructions)
-- Later stages continue normally
+- Later stages continue normally (drain the pipeline)
 
 Example:
   add R2, R3, R4  ; In EX, will write R2
@@ -291,6 +334,13 @@ Example:
 
 IMPORTANT: Even WB stage must be checked because write happens at end of WB,
 and data is only available NEXT cycle for read.
+
+Hazard Check (for instruction in DECODE needing register R as source):
+  hazard = (R == dest_EX && dest_EX != 0 && has_dest_EX) ||
+           (R == dest_MEM && dest_MEM != 0 && has_dest_MEM) ||
+           (R == dest_WB && dest_WB != 0 && has_dest_WB)
+
+Note: R0 is never a hazard (always 0), R1 is never a hazard (special register)
 
 -----------------------------------------------------------------------------
 6.2 MEMORY STALLS
@@ -301,7 +351,7 @@ Resolution: STALL the instruction in MEM
 - All earlier stages (FETCH, DECODE, EXECUTE) also stall
 - Later stages (WB) continue if they have valid instructions
 
-Duration: Until data arrives from bus transaction
+Duration: Until data arrives from bus transaction (typically 16+ cycles)
 
 -----------------------------------------------------------------------------
 6.3 BRANCH HANDLING
@@ -311,6 +361,11 @@ Duration: Until data arrives from bus transaction
 - Branch target: From R[rd], lower 10 bits
 - On taken branch: New PC loaded, but next instruction (delay slot) still fetched
 
+Example with delay slot:
+    PC=6:  blt $zero, $r2, $imm, 100   # if taken, PC = R[0][9:0] = 0
+    PC=7:  add $r8, $r8, $imm, 1       # ALWAYS executes (delay slot)
+    PC=8:  halt                         # executes only if branch not taken
+
 ================================================================================
 SECTION 7: FILE FORMATS
 ================================================================================
@@ -319,357 +374,104 @@ SECTION 7: FILE FORMATS
 7.1 INPUT FILES
 -----------------------------------------------------------------------------
 imem0.txt, imem1.txt, imem2.txt, imem3.txt (Instruction Memory):
-- Format: 8 hexadecimal digits per line
+- Format: 8 hexadecimal digits per line (lowercase or uppercase)
 - Starting address: 0
 - Lines < 1024: Remaining memory is 0
 - Example:
-  0A0B0C0D
-  12345678
-  ...
+  00221001
+  00331001
+  0B021064
+  14000000
 
 memin.txt (Main Memory Initial):
 - Format: 8 hexadecimal digits per line
 - Starting address: 0
 - Lines < 2^21: Remaining memory is 0
+- Contains initial values for shared data
 
 -----------------------------------------------------------------------------
 7.2 OUTPUT FILES
 -----------------------------------------------------------------------------
 memout.txt (Main Memory Final):
 - Same format as memin.txt
-- Contains final memory state
+- Contains final memory state after simulation
+- Should include all words up to the last non-zero word
 
 regout0.txt - regout3.txt (Registers):
-- Contains R2-R15 (14 registers)
-- NOT R0, NOT R1
-- Format: 8 hexadecimal digits per line
+- Contains R2-R15 (14 registers) - NOT R0, NOT R1
+- Format: 8 hexadecimal digits per line (lowercase)
+- 14 lines total per file
+- Example (from example_061225_win/regout0.txt):
+  00000064
+  00000064
+  00000064
+  ... (14 lines total)
 
 core0trace.txt - core3trace.txt (Pipeline Trace):
 - One line per cycle where at least one pipeline stage is active
+- Cycles START from 0 (not 1)
 - Format: CYCLE FETCH DECODE EXEC MEM WB R2 R3 ... R15
-- CYCLE: Decimal
-- Pipeline stages: 3 hex digits OR "---" if inactive
-- Registers: 8 hex digits (value at START of cycle)
+  * CYCLE: Decimal (starts at 0)
+  * Pipeline stages: 3 hex digits (PC value) OR "---" if inactive
+  * Registers: 8 hex digits (value at START of cycle)
+  * Fields separated by single space
 - Example:
-  1 000 --- --- --- --- 00000000 00000000 ...
-  2 001 000 --- --- --- 00000000 00000000 ...
+  0 000 --- --- --- --- 00000000 00000000 00000000 ... (14 reg values)
+  1 001 000 --- --- --- 00000000 00000000 00000000 ...
+  2 002 001 000 --- --- 00000000 00000000 00000000 ...
 
 bustrace.txt (Bus Trace):
 - One line per cycle where bus_cmd != 0
 - Format: CYCLE bus_origid bus_cmd bus_addr bus_data bus_shared
-- CYCLE: Decimal
-- bus_origid, bus_cmd, bus_shared: 1 hex digit
-- bus_addr: 6 hex digits
-- bus_data: 8 hex digits
-- Example:
-  100 0 1 000100 00000000 0
+  * CYCLE: Decimal
+  * bus_origid: 1 hex digit (0-3 for cores, 4 for main memory)
+  * bus_cmd: 1 hex digit (1=BusRd, 2=BusRdX, 3=Flush)
+  * bus_addr: 6 hex digits (21-bit address, leading zeros)
+  * bus_data: 8 hex digits (32-bit data)
+  * bus_shared: 1 hex digit (0 or 1)
+- Example (from example_061225_win/bustrace.txt):
+  5 2 1 00000F 00000000 0       # Cycle 5, Core 2, BusRd, addr 0x0F
+  21 4 3 000008 00000000 0      # Cycle 21, Main Mem, Flush, addr 0x08
 
 dsram0.txt - dsram3.txt (Data Cache SRAM):
-- Format: 8 hex digits per line
-- 512 lines total
+- Format: 8 hex digits per line (lowercase)
+- Exactly 512 lines total
+- Contains cached data values
 
 tsram0.txt - tsram3.txt (Tag Cache SRAM):
-- Format: 8 hex digits per line
-- 64 lines total
-- Each line: MESI[13:12] | TAG[11:0]
+- Format: 8 hex digits per line (lowercase)
+- Exactly 64 lines total
+- Each line: (MESI << 12) | Tag
+- Example values:
+  * 00000000 = Invalid state, tag 0
+  * 00001000 = Shared state (1 << 12), tag 0
+  * 00002000 = Exclusive state (2 << 12), tag 0
+  * 00003000 = Modified state (3 << 12), tag 0
 
 stats0.txt - stats3.txt (Statistics):
-- Format: "name X" where X is decimal
-- Lines:
-  cycles X        - Clock cycles core ran until halt
-  instructions X  - Instructions executed
+- Format: "name X" where X is decimal integer
+- Exactly 8 lines:
+  cycles X        - Clock cycles until core halted and pipeline drained
+  instructions X  - Instructions EXECUTED (not fetched)
   read_hit X      - Cache read hits
   write_hit X     - Cache write hits
   read_miss X     - Cache read misses
   write_miss X    - Cache write misses
-  decode_stall X  - Cycles stalled in decode stage
-  mem_stall X     - Cycles stalled in mem stage
+  decode_stall X  - Cycles instruction stalled in decode stage
+  mem_stall X     - Cycles instruction stalled in mem stage
+
+Example (from example_061225_win/stats2.txt):
+  cycles 1193
+  instructions 508
+  read_hit 100
+  write_hit 101
+  read_miss 2
+  write_miss 1
+  decode_stall 606
+  mem_stall 75
 
 ================================================================================
-SECTION 8: IMPLEMENTATION WORK PLAN
-================================================================================
-
------------------------------------------------------------------------------
-PHASE 1: DATA STRUCTURES (Week 1)
------------------------------------------------------------------------------
-Task 1.1: Define Core Structure
-- 16 registers (32-bit array)
-- PC (10-bit)
-- Pipeline registers for each stage
-- Halted flag
-- Statistics counters
-
-Task 1.2: Define Cache Structure
-- DSRAM array (512 x 32-bit)
-- TSRAM array (64 entries with tag + MESI)
-- Pending transaction state
-- Block buffer for incoming data
-
-Task 1.3: Define Bus Structure
-- All bus signals
-- Current transaction state
-- Arbitration state (last granted core)
-- Transaction progress counter
-
-Task 1.4: Define Main Memory
-- Large array (2^21 x 32-bit) or sparse representation
-- Response state machine
-
-Task 1.5: Define Instruction Memory
-- 4 arrays (1024 x 32-bit each)
-
------------------------------------------------------------------------------
-PHASE 2: INSTRUCTION PARSING (Week 1)
------------------------------------------------------------------------------
-Task 2.1: File Reading Functions
-- Read hex file into instruction memory
-- Read hex file into main memory
-- Handle files shorter than max size
-
-Task 2.2: Instruction Decoding
-- Extract opcode, rd, rs, rt, immediate
-- Sign-extend immediate to 32 bits
-
------------------------------------------------------------------------------
-PHASE 3: SINGLE CORE PIPELINE (Week 2)
------------------------------------------------------------------------------
-Task 3.1: Fetch Stage
-- Read instruction from IMEM[PC]
-- Pass to decode stage register
-
-Task 3.2: Decode Stage
-- Decode instruction fields
-- Read register values
-- Update R1 with sign-extended immediate
-- Check for data hazards
-- Implement stall logic
-- Resolve branches (calculate taken/not taken)
-- Handle delay slot
-
-Task 3.3: Execute Stage
-- Implement all ALU operations
-- Handle signed operations correctly (sra, comparisons)
-
-Task 3.4: Memory Stage
-- Calculate effective address
-- Interface with cache (placeholder for now)
-- Implement stall on cache miss
-
-Task 3.5: Write Back Stage
-- Write result to register file
-- Respect R0 (no write) and R1 (no write) rules
-
-Task 3.6: Pipeline Control
-- Implement stall propagation
-- Handle bubble insertion
-- Track active stages for trace output
-
------------------------------------------------------------------------------
-PHASE 4: CACHE IMPLEMENTATION (Week 3)
------------------------------------------------------------------------------
-Task 4.1: Cache Lookup
-- Extract tag, index, offset from address
-- Check TSRAM for tag match and valid state
-
-Task 4.2: Cache Read (Load)
-- Hit: Return data from DSRAM
-- Miss: Initiate BusRd transaction
-
-Task 4.3: Cache Write (Store)
-- Hit in M/E state: Write to DSRAM, set Modified
-- Hit in S state: Need BusRdX for exclusive access
-- Miss: Initiate BusRdX transaction
-
-Task 4.4: Write-back Logic
-- On eviction of Modified block: Need to flush first
-- Handle dirty block replacement
-
-Task 4.5: Block Fill
-- Receive 8 words from bus
-- Write to DSRAM
-- Update TSRAM with tag and state
-
------------------------------------------------------------------------------
-PHASE 5: BUS AND MESI PROTOCOL (Week 4)
------------------------------------------------------------------------------
-Task 5.1: Bus Arbitration
-- Implement round-robin priority
-- Track last granted core
-- Check bus availability
-
-Task 5.2: BusRd Handling
-- Core initiates, sets bus_shared = 0
-- Other caches snoop and respond
-- Data response handling
-
-Task 5.3: BusRdX Handling
-- Core initiates for write miss
-- Other caches invalidate
-- Handle Modified block in other cache
-
-Task 5.4: Flush Handling
-- 16 cycle delay for first word
-- 8 consecutive cycles for full block
-- Parallel update to main memory
-
-Task 5.5: Snooping Logic
-- Each cache monitors bus every cycle
-- Update local state based on others' transactions
-- Generate responses when needed
-
-Task 5.6: Main Memory Controller
-- Track pending transactions
-- Generate Flush responses after delay
-- Handle writes from Flush
-
------------------------------------------------------------------------------
-PHASE 6: MULTI-CORE INTEGRATION (Week 5)
------------------------------------------------------------------------------
-Task 6.1: Parallel Execution
-- All 4 cores execute each cycle
-- Synchronize on bus access
-- Handle concurrent requests
-
-Task 6.2: Coherency Testing
-- Verify MESI state transitions
-- Test cache-to-cache transfers
-- Test invalidations
-
-Task 6.3: Halt Handling
-- Core halts independently
-- Pipeline must drain
-- Simulation ends when ALL cores halted AND all pipelines empty
-
------------------------------------------------------------------------------
-PHASE 7: OUTPUT GENERATION (Week 5)
------------------------------------------------------------------------------
-Task 7.1: Memory Output
-- Write memout.txt with final main memory
-
-Task 7.2: Register Output
-- Write regout files with R2-R15
-
-Task 7.3: Pipeline Trace
-- Format each cycle correctly
-- Handle "---" for inactive stages
-- Output register values at cycle START
-
-Task 7.4: Bus Trace
-- Log only cycles with bus_cmd != 0
-- Format all fields correctly
-
-Task 7.5: Cache Dump
-- Write DSRAM contents
-- Write TSRAM contents
-
-Task 7.6: Statistics
-- Count all required metrics
-- Write stats files
-
------------------------------------------------------------------------------
-PHASE 8: TESTING (Week 6)
------------------------------------------------------------------------------
-Task 8.1: Counter Test Program
-- 4 cores increment shared counter
-- Sequential access (core 0, then 1, then 2, then 3, repeat)
-- 128 increments per core = 512 total
-- Force conflict miss at end to write back
-
-Task 8.2: Serial Matrix Multiply
-- Single core (core 0)
-- 16x16 matrices
-- Matrix A at 0x000-0x0FF
-- Matrix B at 0x100-0x1FF
-- Result C at 0x200-0x2FF
-- Row-major order (C style)
-
-Task 8.3: Parallel Matrix Multiply
-- All 4 cores
-- Divide work (e.g., each core does 4 rows of result)
-- Minimize execution time
-- Handle cache coherency for shared data
-
-================================================================================
-SECTION 9: DEBUGGING CHECKLIST
-================================================================================
-
------------------------------------------------------------------------------
-9.1 COMMON PIPELINE BUGS
------------------------------------------------------------------------------
-[ ] R0 writes should be ignored
-[ ] R1 should not be writable by instructions
-[ ] R1 should update with sign-extended immediate every decode
-[ ] Sign extension of 12-bit immediate to 32-bit (check negative numbers)
-[ ] Branch target from R[rd] not rd field directly
-[ ] Only lower 10 bits of branch target used
-[ ] Delay slot instruction always executes
-[ ] Data hazard detection includes WB stage
-[ ] Stall in decode stops fetch too
-[ ] Branch resolution in decode (not execute)
-[ ] jal saves to R[15] specifically
-[ ] Signed comparisons for blt, bgt, ble, bge
-
------------------------------------------------------------------------------
-9.2 COMMON CACHE BUGS
------------------------------------------------------------------------------
-[ ] Direct mapped indexing correct
-[ ] Tag comparison correct
-[ ] MESI state transitions correct
-[ ] Write-back on eviction of Modified
-[ ] Write-allocate on miss
-[ ] Block offset handling (8 words per block)
-[ ] TSRAM initialized to 0 (Invalid state)
-
------------------------------------------------------------------------------
-9.3 COMMON BUS BUGS
------------------------------------------------------------------------------
-[ ] Round-robin priority (last granted = lowest priority)
-[ ] bus_shared set by snoopers, not initiator
-[ ] 16 cycle delay for main memory response
-[ ] 8 consecutive cycles for block transfer
-[ ] Modified cache responds instead of main memory
-[ ] Main memory updates on Flush from Modified cache
-[ ] No new transaction until previous completes
-
------------------------------------------------------------------------------
-9.4 COMMON OUTPUT BUGS
------------------------------------------------------------------------------
-[ ] Pipeline trace: register values at START of cycle
-[ ] Pipeline trace: "---" for inactive stages (three dashes)
-[ ] Bus trace: only when bus_cmd != 0
-[ ] Stats: instructions count (executed, not fetched)
-[ ] Stats: decode_stall counts cycles, not occurrences
-[ ] regout: only R2-R15, not R0 or R1
-[ ] Hex format: correct number of digits for each field
-
-================================================================================
-SECTION 10: KEY FORMULAS AND CALCULATIONS
-================================================================================
-
-Cache Address Breakdown:
-  block_offset = address[2:0]     (3 bits, 0-7)
-  index        = address[8:3]     (6 bits, 0-63)
-  tag          = address[20:9]    (12 bits)
-
-DSRAM Address = (index * 8) + block_offset = address[8:0]
-
-TSRAM Address = index = address[8:3]
-
-TSRAM Entry = (MESI << 12) | tag
-
-Sign Extension (12-bit to 32-bit):
-  if (immediate & 0x800)  // bit 11 is set
-    extended = immediate | 0xFFFFF000
-  else
-    extended = immediate
-
-Pipeline Hazard Check (instruction in DECODE needs register R):
-  hazard = (R == dest_EX && dest_EX != 0) ||
-           (R == dest_MEM && dest_MEM != 0) ||
-           (R == dest_WB && dest_WB != 0)
-
-================================================================================
-SECTION 11: COMMAND LINE PARAMETERS
+SECTION 8: COMMAND LINE PARAMETERS
 ================================================================================
 
 27 parameters in order:
@@ -704,63 +506,142 @@ SECTION 11: COMMAND LINE PARAMETERS
 Default behavior: If no parameters, use above names from exe directory.
 
 ================================================================================
-SECTION 12: TEST PROGRAM REQUIREMENTS
+SECTION 9: KEY FORMULAS AND CALCULATIONS
 ================================================================================
 
 -----------------------------------------------------------------------------
-12.1 COUNTER TEST (counter/)
+9.1 CACHE ADDRESS BREAKDOWN
 -----------------------------------------------------------------------------
-Purpose: Test multi-core synchronization and cache coherency
+For 21-bit word address:
+  block_offset = address[2:0]     (3 bits, values 0-7)
+  index        = address[8:3]     (6 bits, values 0-63)
+  tag          = address[20:9]    (12 bits)
 
-Requirements:
-- All 4 cores run in parallel
-- Shared counter at address 0x000000
-- Initial value: 0
-- Each core increments 128 times
-- Sequential order: core 0 -> core 1 -> core 2 -> core 3 -> repeat
-- Total increments: 4 * 128 = 512
-- Final value: 512
-- MUST force write-back via conflict miss at end
-- Expected memout.txt shows 512 (0x00000200) at address 0
+DSRAM Address = (index * 8) + block_offset = address[8:0]  (9 bits)
 
-Synchronization approach:
-- Use another memory location as "turn" indicator
-- Core waits until turn == its_id
-- After increment, sets turn = (turn + 1) % 4
+TSRAM Address = index = address[8:3]  (6 bits)
+
+TSRAM Entry = (MESI << 12) | tag
 
 -----------------------------------------------------------------------------
-12.2 SERIAL MATRIX MULTIPLY (mulserial/)
+9.2 SIGN EXTENSION (12-bit to 32-bit)
 -----------------------------------------------------------------------------
-Purpose: Test single core, memory access patterns
+if (immediate & 0x800)  // bit 11 is set (negative number)
+    extended = immediate | 0xFFFFF000
+else
+    extended = immediate & 0x00000FFF
 
-Requirements:
-- Only core 0 runs (cores 1-3 just halt)
-- Matrix A: 16x16 at addresses 0x000 - 0x0FF (256 words)
-- Matrix B: 16x16 at addresses 0x100 - 0x1FF (256 words)
-- Matrix C: 16x16 at addresses 0x200 - 0x2FF (256 words)
-- Row-major order (C style):
-  A[i][j] at address: 0x000 + i*16 + j
-  B[i][j] at address: 0x100 + i*16 + j
-  C[i][j] at address: 0x200 + i*16 + j
-- C[i][j] = sum(A[i][k] * B[k][j]) for k=0..15
-- Assume no overflow
+Example:
+- 0x001 (1) -> 0x00000001 (positive)
+- 0xFFF (-1 in 12-bit) -> 0xFFFFFFFF (-1 in 32-bit)
+- 0x800 (-2048) -> 0xFFFFF800
 
 -----------------------------------------------------------------------------
-12.3 PARALLEL MATRIX MULTIPLY (mulparallel/)
+9.3 PIPELINE HAZARD CHECK
 -----------------------------------------------------------------------------
-Purpose: Test parallel execution, cache coherency, performance optimization
+For instruction in DECODE needing register R as source:
+  hazard = (R == dest_EX && dest_EX != 0 && instruction_in_EX_writes_reg) ||
+           (R == dest_MEM && dest_MEM != 0 && instruction_in_MEM_writes_reg) ||
+           (R == dest_WB && dest_WB != 0 && instruction_in_WB_writes_reg)
 
-Requirements:
-- All 4 cores compute parts of result
-- Same memory layout as serial
-- Divide work for parallelism:
-  * Core 0: rows 0-3 of result
-  * Core 1: rows 4-7 of result
-  * Core 2: rows 8-11 of result
-  * Core 3: rows 12-15 of result
-- Optimize for minimum execution time
-- Handle that cores read same data from A and B (coherency)
+Note: Don't check hazards for R0 (always 0) or R1 (always immediate).
+Instructions that write registers: add, sub, and, or, xor, mul, sll, sra, srl, lw, jal
 
 ================================================================================
-END OF WORK PLAN
+SECTION 10: SIMULATION END CONDITIONS
+================================================================================
+
+Simulation continues until ALL of these are true:
+1. All 4 cores have executed a HALT instruction
+2. All 4 pipelines are empty (no instructions in any stage)
+
+A core that executes HALT:
+- Stops fetching new instructions
+- Allows pipeline to drain (existing instructions complete)
+- Continues to participate in cache snooping
+
+================================================================================
+SECTION 11: DEBUGGING CHECKLIST
+================================================================================
+
+-----------------------------------------------------------------------------
+11.1 COMMON PIPELINE BUGS
+-----------------------------------------------------------------------------
+[ ] R0 writes should be ignored
+[ ] R1 should not be writable by instructions
+[ ] R1 should update with sign-extended immediate every decode
+[ ] Sign extension of 12-bit immediate to 32-bit (check negative numbers)
+[ ] Branch target from R[rd] value, not rd field directly
+[ ] Only lower 10 bits of branch target used
+[ ] Delay slot instruction always executes
+[ ] Data hazard detection includes WB stage
+[ ] Stall in decode stops fetch too
+[ ] Branch resolution in decode (not execute)
+[ ] jal saves to R[15] specifically
+[ ] Signed comparisons for blt, bgt, ble, bge
+
+-----------------------------------------------------------------------------
+11.2 COMMON CACHE BUGS
+-----------------------------------------------------------------------------
+[ ] Direct mapped indexing correct
+[ ] Tag comparison correct
+[ ] MESI state transitions correct
+[ ] Write-back on eviction of Modified
+[ ] Write-allocate on miss
+[ ] Block offset handling (8 words per block)
+[ ] TSRAM initialized to 0 (Invalid state)
+[ ] BusRdX for write to Shared state (need to upgrade)
+
+-----------------------------------------------------------------------------
+11.3 COMMON BUS BUGS
+-----------------------------------------------------------------------------
+[ ] Round-robin priority (last granted = lowest priority)
+[ ] bus_shared set by snoopers, not initiator
+[ ] 16 cycle delay for main memory response
+[ ] 8 consecutive cycles for block transfer
+[ ] Modified cache responds instead of main memory
+[ ] Main memory updates on Flush from Modified cache
+[ ] No new transaction until previous completes
+
+-----------------------------------------------------------------------------
+11.4 COMMON OUTPUT BUGS
+-----------------------------------------------------------------------------
+[ ] Pipeline trace: cycle starts at 0
+[ ] Pipeline trace: register values at START of cycle
+[ ] Pipeline trace: "---" for inactive stages (three dashes)
+[ ] Bus trace: only when bus_cmd != 0
+[ ] Stats: instructions count (EXECUTED, not fetched)
+[ ] Stats: decode_stall counts cycles, not occurrences
+[ ] regout: only R2-R15, not R0 or R1 (14 lines)
+[ ] Hex format: correct number of digits for each field
+[ ] DSRAM: exactly 512 lines
+[ ] TSRAM: exactly 64 lines
+
+================================================================================
+SECTION 12: EXAMPLE ANALYSIS
+================================================================================
+
+Based on example_061225_win:
+
+Core 0 (imem0.asm): Simple loop with adds, no memory access
+- stats0.txt: cycles=805, instructions=801, no cache activity, no stalls
+
+Core 1 (imem1.asm): Similar to Core 0
+- stats1.txt: cycles=705, instructions=501, decode_stall=200
+
+Core 2 (imem2.asm): Read/write loop to memory addresses 15, 17
+- stats2.txt: cycles=1193, instructions=508, read_hit=100, write_hit=101,
+              read_miss=2, write_miss=1, decode_stall=606, mem_stall=75
+
+Core 3 (imem3.asm): Branches with single load at end
+- stats3.txt: cycles=1616, instructions=1602, read_miss=1, mem_stall=10
+
+Bus trace shows:
+- Cycle 5: Core 2 BusRd for address 0x0F (cache miss)
+- Cycles 21-28: Main memory Flush response
+- Cycle 31: Core 2 BusRd for address 0x11
+- And so on...
+
+================================================================================
+END OF SPECIFICATION
 ================================================================================

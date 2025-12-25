@@ -1,4 +1,4 @@
-check C compiler in vs code:
+check C compiler:
 gcc --version
 
 compile:
@@ -6,3 +6,7 @@ gcc -o sim.exe sim.c -std=c99 -Wall -Werror
 
 run:
 ./sim.exe
+
+clean directory:
+Remove-Item imem*.txt, memin.txt, memout.txt, regout*.txt, core*trace.txt, bustrace.txt, dsram*.txt, tsram*.txt, stats*.txt
+
