@@ -1,6 +1,5 @@
 /*
  * Multi-Core MESI Cache Coherency Simulator
- * Course 0512.4461 - Computer Architecture
  * 
  * Implements:
  * - 4 symmetric cores with 5-stage pipelines
@@ -9,13 +8,15 @@
  * - Round-robin bus arbitration
  */
 
+ #define _CRT_SECURE_NO_WARNINGS // Disable secure warnings for compatibility
+ 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ============================================================================
+/* ---------------------------------------------------------------------------
  * CONFIGURATION CONSTANTS
  * ============================================================================ */
 
@@ -54,92 +55,100 @@ typedef enum {
     OP_HALT = 20
 } Opcode;
 
-/* ============================================================================
- * MESI STATE DEFINITIONS
- * ============================================================================ */
-
+/* MESI protocol states for cache coherency */
 typedef enum {
-    MESI_INVALID   = 0,
-    MESI_SHARED    = 1,
-    MESI_EXCLUSIVE = 2,
-    MESI_MODIFIED  = 3
+    MESI_INVALID   = 0,  // Block not valid in cache
+    MESI_SHARED    = 1,  // Block is clean and may exist in other caches
+    MESI_EXCLUSIVE = 2,  // Block is clean and only in this cache
+    MESI_MODIFIED  = 3   // Block is dirty and only in this cache
 } MesiState;
 
-/* ============================================================================
- * BUS COMMAND DEFINITIONS
- * ============================================================================ */
-
+/* Bus commands for cache coherency protocol */
 typedef enum {
-    BUS_NO_CMD = 0,
-    BUS_RD     = 1,
-    BUS_RDX    = 2,
-    BUS_FLUSH  = 3
+    BUS_NO_CMD = 0,  // No operation on bus
+    BUS_RD     = 1,  // Read request (shared access)
+    BUS_RDX    = 2,  // Read exclusive request (for writing)
+    BUS_FLUSH  = 3   // Flush data to bus (response to BusRd/BusRdX)
 } BusCmd;
 
-#define BUS_ORIGID_MEM 4
+#define BUS_ORIGID_MEM 4  // Indicates main memory is the originator
 
 /* ============================================================================
  * DATA STRUCTURES
  * ============================================================================ */
 
-/* Decoded instruction */
+/**
+ * Decoded instruction structure
+ * Holds all the fields extracted from a 32-bit instruction word
+ */
 typedef struct {
     uint8_t  opcode;
-    uint8_t  rd;
-    uint8_t  rs;
-    uint8_t  rt;
-    int32_t  imm;       /* sign-extended */
-    uint32_t raw;       /* original instruction */
+    uint8_t  rd;        // Destination register
+    uint8_t  rs;        // Source register 1
+    uint8_t  rt;        // Source register 2
+    int32_t  imm;       /* sign-extended immediate value */
+    uint32_t raw;       /* original instruction word */
 } Instruction;
 
-/* Pipeline register between stages */
+/**
+ * Pipeline register structure
+ * Passed between pipeline stages to carry instruction state
+ */
 typedef struct {
     Instruction inst;
     uint32_t    pc;
-    int32_t     rs_val;
-    int32_t     rt_val;
-    int32_t     rd_val;
-    int32_t     alu_result;
-    uint32_t    mem_addr;
-    int32_t     mem_data;
-    bool        valid;
-    bool        writes_reg;
-    uint8_t     dest_reg;
+    int32_t     rs_val;      // Value read from rs
+    int32_t     rt_val;      // Value read from rt
+    int32_t     rd_val;      // Value read from rd (for branches/stores)
+    int32_t     alu_result;  // Result from ALU
+    uint32_t    mem_addr;    // Memory address for load/store
+    int32_t     mem_data;    // Data to write for stores
+    bool        valid;       // Is this stage active?
+    bool        writes_reg;  // Does instruction write to a register?
+    uint8_t     dest_reg;    // Which register is being written?
 } PipelineReg;
 
-/* Cache structure */
+/**
+ * Cache structure with data and tag SRAMs
+ */
 typedef struct {
-    uint32_t dsram[CACHE_SIZE];                 /* Data SRAM */
-    uint32_t tsram[NUM_CACHE_BLOCKS];           /* Tag SRAM (MESI | Tag) */
+    uint32_t dsram[CACHE_SIZE];                 /* Data SRAM - actual data */
+    uint32_t tsram[NUM_CACHE_BLOCKS];           /* Tag SRAM - MESI state + tag bits */
 } Cache;
 
-/* Bus transaction state */
+/**
+ * Bus transaction state
+ * Tracks ongoing bus transactions and arbitration
+ */
 typedef struct {
+    // Current bus state (visible to all cores)
     int      origid;
     BusCmd   cmd;
     uint32_t addr;
     uint32_t data;
-    int      shared;
+    int      shared;  // Set to 1 if block exists in multiple caches
     
-    /* For ongoing transactions */
+    /* State for multi-cycle transactions */
     bool     busy;                  /* Transaction in progress */
-    int      flush_origid;          /* Who is providing the flush */
-    int      requesting_core;       /* Who requested */
-    int      delay_counter;         /* For memory latency */
-    int      words_transferred;     /* Words transferred so far */
-    uint32_t block_buffer[BLOCK_SIZE];  /* Buffer for incoming block */
+    int      flush_origid;          /* Who is providing the flush data */
+    int      requesting_core;       /* Which core requested the data */
+    int      delay_counter;         /* Countdown for memory latency */
+    int      words_transferred;     /* How many words sent so far */
+    uint32_t block_buffer[BLOCK_SIZE];  /* Buffer for incoming block data */
     BusCmd   original_cmd;          /* Original command (BusRd/BusRdX) */
     uint32_t original_addr;         /* Original block address */
-    int      sampled_shared;        /* bus_shared sampled when BusRd/BusRdX issued */
+    int      sampled_shared;        /* Sampled bus_shared value when request issued */
     
-    /* For writeback (eviction) tracking */
-    bool     writeback_in_progress; /* Writeback flush in progress */
-    int      writeback_core;        /* Core doing writeback */
+    /* Writeback (eviction) tracking */
+    bool     writeback_in_progress; /* Currently writing back modified block */
+    int      writeback_core;        /* Core doing the writeback */
     uint32_t writeback_addr;        /* Block address being written back */
-    int      writeback_word;        /* Current word being written */
+    int      writeback_word;        /* Current word index being written */
 } Bus;
 
-/* Core statistics */
+/**
+ * Core statistics for performance analysis
+ */
 typedef struct {
     int cycles;
     int instructions;
@@ -151,7 +160,10 @@ typedef struct {
     int mem_stall;
 } Stats;
 
-/* Core state */
+/**
+ * Core state structure
+ * Contains all state for a single processor core
+ */
 typedef struct {
     int          id;
     uint32_t     regs[NUM_REGISTERS];
@@ -159,34 +171,34 @@ typedef struct {
     uint32_t     imem[IMEM_SIZE];
     Cache        cache;
     
-    /* Pipeline registers */
+    /* Pipeline registers between stages */
     PipelineReg  if_id;     /* Fetch -> Decode */
     PipelineReg  id_ex;     /* Decode -> Execute */
     PipelineReg  ex_mem;    /* Execute -> Memory */
     PipelineReg  mem_wb;    /* Memory -> Writeback */
     
-    /* Pipeline control */
-    bool         halted;            /* Core has halted */
+    /* Pipeline control signals */
+    bool         halted;            /* Core has executed HALT */
     bool         stall_fetch;       /* Stall fetch stage */
     bool         stall_decode;      /* Stall decode stage */
     bool         stall_mem;         /* Stall mem stage */
     
     /* Branch handling */
     bool         branch_taken;      /* Branch was taken this cycle */
-    uint32_t     branch_target;     /* Target PC */
+    uint32_t     branch_target;     /* Target PC for branch */
     
     /* Cache transaction state */
-    bool         cache_busy;
-    bool         waiting_for_bus;
-    BusCmd       pending_bus_cmd;
-    uint32_t     pending_addr;
-    bool         need_writeback;
-    uint32_t     writeback_addr;
+    bool         cache_busy;         // Cache is waiting for bus transaction
+    bool         waiting_for_bus;    // Waiting for bus access
+    BusCmd       pending_bus_cmd;    // Command to issue when bus granted
+    uint32_t     pending_addr;       // Address for pending request
+    bool         need_writeback;     // Need to writeback before fetch
+    uint32_t     writeback_addr;     // Address of block to writeback
     
     /* For pending store after cache fill */
-    bool         pending_store;
-    uint32_t     pending_store_addr;
-    uint32_t     pending_store_data;
+    bool         pending_store;      // Store waiting to complete after fill
+    uint32_t     pending_store_addr; // Address for pending store
+    uint32_t     pending_store_data; // Data for pending store
     
     Stats        stats;
 } Core;
@@ -209,7 +221,10 @@ static FILE    *g_bus_trace;
  * UTILITY FUNCTIONS
  * ============================================================================ */
 
-/* Sign-extend 12-bit immediate to 32-bit */
+/**
+ * Sign-extend 12-bit immediate to 32-bit signed integer
+ * Checks bit 11 and extends if negative
+ */
 static int32_t sign_extend_12(uint32_t val) {
     if (val & 0x800) {
         return (int32_t)(val | 0xFFFFF000);
@@ -217,42 +232,65 @@ static int32_t sign_extend_12(uint32_t val) {
     return (int32_t)val;
 }
 
-/* Extract cache tag from address */
+/**
+ * Extract cache tag from memory address
+ * Tag is bits [20:9] of the address
+ */
 static uint32_t get_tag(uint32_t addr) {
     return (addr >> 9) & 0xFFF;  /* bits [20:9] */
 }
 
-/* Extract cache index from address */
+/**
+ * Extract cache index from memory address
+ * Index is bits [8:3] - selects which cache line
+ */
 static uint32_t get_index(uint32_t addr) {
     return (addr >> 3) & 0x3F;   /* bits [8:3] */
 }
 
-/* Extract block offset from address */
+/**
+ * Extract block offset from memory address
+ * Offset is bits [2:0] - word within the block
+ */
 static uint32_t get_offset(uint32_t addr) {
     return addr & 0x7;           /* bits [2:0] */
 }
 
-/* Get block-aligned address */
+/**
+ * Get block-aligned address (zero out offset bits)
+ */
 static uint32_t get_block_addr(uint32_t addr) {
     return addr & ~0x7;
 }
 
-/* Get MESI state from TSRAM entry */
+/**
+ * Extract MESI state from TSRAM entry
+ * MESI state is stored in bits [13:12]
+ */
 static MesiState get_mesi_state(uint32_t tsram_entry) {
     return (MesiState)((tsram_entry >> 12) & 0x3);
 }
 
-/* Get tag from TSRAM entry */
+/**
+ * Extract tag from TSRAM entry
+ * Tag is stored in bits [11:0]
+ */
 static uint32_t get_tsram_tag(uint32_t tsram_entry) {
     return tsram_entry & 0xFFF;
 }
 
-/* Create TSRAM entry from MESI state and tag */
+/**
+ * Create TSRAM entry from MESI state and tag
+ * Packs both into a single 32-bit word
+ */
 static uint32_t make_tsram_entry(MesiState mesi, uint32_t tag) {
     return ((uint32_t)mesi << 12) | (tag & 0xFFF);
 }
 
-/* Decode instruction */
+/**
+ * Decode a 32-bit instruction word into its components
+ * Extracts opcode, registers, and immediate value
+ */
 static Instruction decode_instruction(uint32_t raw) {
     Instruction inst;
     inst.raw    = raw;
@@ -264,17 +302,24 @@ static Instruction decode_instruction(uint32_t raw) {
     return inst;
 }
 
-/* Check if opcode is a branch */
+/**
+ * Check if opcode is a branch instruction
+ */
 static bool is_branch(uint8_t opcode) {
     return opcode >= OP_BEQ && opcode <= OP_JAL;
 }
 
-/* Check if instruction writes to a register */
+/**
+ * Check if instruction writes to a register
+ */
 static bool writes_register(uint8_t opcode) {
     return opcode <= OP_SRL || opcode == OP_JAL || opcode == OP_LW;
 }
 
-/* Get destination register for an instruction */
+/**
+ * Get destination register for an instruction
+ * JAL always writes to R15, others use rd field
+ */
 static uint8_t get_dest_reg(Instruction *inst) {
     if (inst->opcode == OP_JAL) {
         return 15;  /* jal always writes to R15 */
@@ -289,6 +334,10 @@ static uint8_t get_dest_reg(Instruction *inst) {
  * FILE I/O FUNCTIONS
  * ============================================================================ */
 
+/**
+ * Load instruction memory from file
+ * Each line is a 32-bit hex instruction
+ */
 static void load_imem(const char *filename, uint32_t *imem) {
     FILE *f = fopen(filename, "r");
     memset(imem, 0, IMEM_SIZE * sizeof(uint32_t));
@@ -304,6 +353,10 @@ static void load_imem(const char *filename, uint32_t *imem) {
     fclose(f);
 }
 
+/**
+ * Load main memory from file
+ * Each line is a 32-bit hex word
+ */
 static void load_main_mem(const char *filename) {
     FILE *f = fopen(filename, "r");
     memset(g_main_mem, 0, sizeof(g_main_mem));
@@ -319,6 +372,10 @@ static void load_main_mem(const char *filename) {
     fclose(f);
 }
 
+/**
+ * Write main memory to file at end of simulation
+ * Only writes up to last non-zero word to save space
+ */
 static void write_main_mem(const char *filename) {
     FILE *f = fopen(filename, "w");
     if (!f) return;
@@ -339,6 +396,10 @@ static void write_main_mem(const char *filename) {
     fclose(f);
 }
 
+/**
+ * Write register file to output file
+ * Only writes R2-R15 (R0 is constant 0, R1 is immediate)
+ */
 static void write_regout(const char *filename, Core *core) {
     FILE *f = fopen(filename, "w");
     if (!f) return;
@@ -351,6 +412,9 @@ static void write_regout(const char *filename, Core *core) {
     fclose(f);
 }
 
+/**
+ * Write cache data SRAM to file
+ */
 static void write_dsram(const char *filename, Core *core) {
     FILE *f = fopen(filename, "w");
     if (!f) return;
@@ -362,6 +426,9 @@ static void write_dsram(const char *filename, Core *core) {
     fclose(f);
 }
 
+/**
+ * Write cache tag SRAM to file
+ */
 static void write_tsram(const char *filename, Core *core) {
     FILE *f = fopen(filename, "w");
     if (!f) return;
@@ -373,6 +440,9 @@ static void write_tsram(const char *filename, Core *core) {
     fclose(f);
 }
 
+/**
+ * Write performance statistics to file
+ */
 static void write_stats(const char *filename, Core *core) {
     FILE *f = fopen(filename, "w");
     if (!f) return;
@@ -393,6 +463,10 @@ static void write_stats(const char *filename, Core *core) {
  * TRACE OUTPUT
  * ============================================================================ */
 
+/**
+ * Write core pipeline trace for current cycle
+ * Shows which instruction is in each pipeline stage and register values
+ */
 static void write_core_trace(Core *core) {
     FILE *f = g_trace_files[core->id];
     if (!f) return;
@@ -406,6 +480,7 @@ static void write_core_trace(Core *core) {
     
     bool any_active = fetch_active || decode_active || exec_active || mem_active || wb_active;
     
+    // Don't write trace if no stages are active
     if (!any_active) return;
     
     fprintf(f, "%d ", g_cycle);
@@ -453,6 +528,10 @@ static void write_core_trace(Core *core) {
     fprintf(f, "\n");
 }
 
+/**
+ * Write bus trace for current cycle
+ * Only writes if there's a command on the bus
+ */
 static void write_bus_trace(void) {
     if (g_bus.cmd == BUS_NO_CMD) return;
     if (!g_bus_trace) return;
@@ -466,7 +545,10 @@ static void write_bus_trace(void) {
  * CACHE OPERATIONS
  * ============================================================================ */
 
-/* Check if cache has a block (tag match and valid state) */
+/**
+ * Check if cache has a block (tag match and valid state)
+ * Returns true if block is present and not invalid
+ */
 static bool cache_has_block(Cache *cache, uint32_t addr) {
     uint32_t index = get_index(addr);
     uint32_t tag = get_tag(addr);
@@ -477,34 +559,46 @@ static bool cache_has_block(Cache *cache, uint32_t addr) {
     return (state != MESI_INVALID) && (stored_tag == tag);
 }
 
-/* Read word from cache - assumes hit */
+/**
+ * Read word from cache
+ * Assumes cache hit (caller should check first)
+ */
 static uint32_t cache_read(Cache *cache, uint32_t addr) {
     uint32_t index = get_index(addr);
     uint32_t offset = get_offset(addr);
     return cache->dsram[index * BLOCK_SIZE + offset];
 }
 
-/* Write word to cache */
+/**
+ * Write word to cache
+ */
 static void cache_write(Cache *cache, uint32_t addr, uint32_t data) {
     uint32_t index = get_index(addr);
     uint32_t offset = get_offset(addr);
     cache->dsram[index * BLOCK_SIZE + offset] = data;
 }
 
-/* Get MESI state for a block */
+/**
+ * Get MESI state for a block
+ */
 static MesiState cache_get_state(Cache *cache, uint32_t addr) {
     uint32_t index = get_index(addr);
     return get_mesi_state(cache->tsram[index]);
 }
 
-/* Set MESI state for a block */
+/**
+ * Set MESI state for a block
+ */
 static void cache_set_state(Cache *cache, uint32_t addr, MesiState state) {
     uint32_t index = get_index(addr);
     uint32_t tag = get_tag(addr);
     cache->tsram[index] = make_tsram_entry(state, tag);
 }
 
-/* Check if current block needs writeback before eviction */
+/**
+ * Check if current block needs writeback before eviction
+ * Returns true if different tag and block is modified
+ */
 static bool cache_needs_writeback(Cache *cache, uint32_t addr) {
     uint32_t index = get_index(addr);
     uint32_t tsram_entry = cache->tsram[index];
@@ -516,14 +610,20 @@ static bool cache_needs_writeback(Cache *cache, uint32_t addr) {
     return (stored_tag != new_tag) && (state == MESI_MODIFIED);
 }
 
-/* Get address of block currently in cache line (for writeback) */
+/**
+ * Get address of block currently in cache line (for writeback)
+ * Reconstructs address from stored tag and index
+ */
 static uint32_t cache_get_current_block_addr(Cache *cache, uint32_t new_addr) {
     uint32_t index = get_index(new_addr);
     uint32_t stored_tag = get_tsram_tag(cache->tsram[index]);
     return (stored_tag << 9) | (index << 3);
 }
 
-/* Fill cache block from buffer */
+/**
+ * Fill cache block from buffer
+ * Copies entire block into cache and updates tag/state
+ */
 static void cache_fill_block(Cache *cache, uint32_t addr, uint32_t *data, MesiState state) {
     uint32_t index = get_index(addr);
     uint32_t tag = get_tag(addr);
@@ -541,7 +641,10 @@ static void cache_fill_block(Cache *cache, uint32_t addr, uint32_t *data, MesiSt
  * BUS OPERATIONS
  * ============================================================================ */
 
-/* Round-robin arbitration */
+/**
+ * Round-robin bus arbitration
+ * Grants bus to next requesting core after last granted
+ */
 static int arbitrate_bus(bool requests[NUM_CORES]) {
     /* Start from core after last granted */
     for (int i = 1; i <= NUM_CORES; i++) {
@@ -550,14 +653,17 @@ static int arbitrate_bus(bool requests[NUM_CORES]) {
             return idx;
         }
     }
-    return -1;
+    return -1;  // No requests
 }
 
 /* ============================================================================
  * SNOOPING LOGIC
  * ============================================================================ */
 
-/* Check if any cache has the block and set bus_shared accordingly */
+/**
+ * Check if any cache has the block and set bus_shared accordingly
+ * Used when issuing BusRd to determine if block is shared
+ */
 static void snoop_and_set_shared(uint32_t addr, int requesting_core) {
     g_bus.shared = 0;
     
@@ -572,7 +678,10 @@ static void snoop_and_set_shared(uint32_t addr, int requesting_core) {
     }
 }
 
-/* Find which core has the block in Modified state */
+/**
+ * Find which core has the block in Modified state
+ * Returns core ID or -1 if no core has it modified
+ */
 static int find_modified_owner(uint32_t addr, int requesting_core) {
     for (int i = 0; i < NUM_CORES; i++) {
         if (i == requesting_core) continue;
@@ -587,7 +696,10 @@ static int find_modified_owner(uint32_t addr, int requesting_core) {
     return -1;
 }
 
-/* Update snooping caches when BusRd/BusRdX is issued */
+/**
+ * Update snooping caches when BusRd/BusRdX is issued
+ * Implements MESI state transitions on other caches
+ */
 static void snoop_update_states(uint32_t addr, BusCmd cmd, int requesting_core) {
     for (int i = 0; i < NUM_CORES; i++) {
         if (i == requesting_core) continue;
@@ -601,6 +713,7 @@ static void snoop_update_states(uint32_t addr, BusCmd cmd, int requesting_core) 
             /* Another core wants to read */
             switch (state) {
                 case MESI_EXCLUSIVE:
+                    // Transition from Exclusive to Shared
                     cache_set_state(cache, addr, MESI_SHARED);
                     break;
                 case MESI_MODIFIED:
@@ -614,6 +727,7 @@ static void snoop_update_states(uint32_t addr, BusCmd cmd, int requesting_core) 
             switch (state) {
                 case MESI_SHARED:
                 case MESI_EXCLUSIVE:
+                    // Invalidate block since other core wants to write
                     cache_set_state(cache, addr, MESI_INVALID);
                     break;
                 case MESI_MODIFIED:
@@ -630,14 +744,20 @@ static void snoop_update_states(uint32_t addr, BusCmd cmd, int requesting_core) 
  * PIPELINE REGISTER READ/WRITE
  * ============================================================================ */
 
-/* Read register value (handles R0 and R1 specially) */
+/**
+ * Read register value (handles R0 and R1 specially)
+ * R0 is always 0, R1 is the immediate value
+ */
 static int32_t read_reg(Core *core, uint8_t reg, int32_t imm) {
     if (reg == 0) return 0;
     if (reg == 1) return imm;
     return (int32_t)core->regs[reg];
 }
 
-/* Write register value (ignores R0 and R1) */
+/**
+ * Write register value (ignores R0 and R1)
+ * R0 and R1 are read-only
+ */
 static void write_reg(Core *core, uint8_t reg, int32_t value) {
     if (reg == 0 || reg == 1) return;
     core->regs[reg] = (uint32_t)value;
@@ -647,6 +767,10 @@ static void write_reg(Core *core, uint8_t reg, int32_t value) {
  * BUS TRANSACTION PROCESSING
  * ============================================================================ */
 
+/**
+ * Process bus transactions for current cycle
+ * Handles writebacks, flushes, and new requests
+ */
 static void process_bus_transactions(void) {
     /* Default: no command on bus */
     g_bus.cmd = BUS_NO_CMD;
@@ -656,6 +780,7 @@ static void process_bus_transactions(void) {
         Core *core = &g_cores[g_bus.writeback_core];
         uint32_t wb_addr = g_bus.writeback_addr + g_bus.writeback_word;
         
+        // Set bus signals for this word
         g_bus.origid = core->id;
         g_bus.cmd = BUS_FLUSH;
         g_bus.addr = wb_addr;
@@ -711,10 +836,10 @@ static void process_bus_transactions(void) {
         g_bus.words_transferred++;
         
         if (g_bus.words_transferred >= BLOCK_SIZE) {
-            /* Transaction complete */
+            /* Transaction complete - fill cache and clean up */
             Core *req_core = &g_cores[g_bus.requesting_core];
             
-            /* Determine new MESI state */
+            /* Determine new MESI state based on request type and sharing */
             MesiState new_state;
             if (g_bus.original_cmd == BUS_RDX) {
                 new_state = MESI_MODIFIED;  /* Will write immediately */
@@ -742,7 +867,7 @@ static void process_bus_transactions(void) {
                 }
             }
             
-            /* Clear stalls */
+            /* Clear stalls - cache is ready now */
             req_core->cache_busy = false;
             req_core->stall_mem = false;
             req_core->stall_decode = false;
@@ -754,29 +879,29 @@ static void process_bus_transactions(void) {
         return;
     }
     
-    /* Check for new bus requests */
+    /* Check for new bus requests from cores */
     bool requests[NUM_CORES] = {false};
     
     for (int i = 0; i < NUM_CORES; i++) {
         Core *core = &g_cores[i];
         
-        /* Handle writeback first, then waiting_for_bus */
+        /* Request bus if need writeback or waiting for data */
         if (core->need_writeback || core->waiting_for_bus) {
             requests[i] = true;
         }
     }
     
-    /* Arbitrate */
+    /* Arbitrate - who gets the bus this cycle? */
     int granted = arbitrate_bus(requests);
     if (granted < 0) {
-        return;
+        return;  // No requests
     }
     
     Core *core = &g_cores[granted];
     g_last_granted = granted;
     
     if (core->need_writeback) {
-        /* Start writeback - this locks the bus */
+        /* Start writeback - this locks the bus for multiple cycles */
         g_bus.writeback_in_progress = true;
         g_bus.writeback_core = core->id;
         g_bus.writeback_addr = core->writeback_addr;
@@ -804,6 +929,7 @@ static void process_bus_transactions(void) {
         /* Initiate BusRd or BusRdX */
         uint32_t block_addr = get_block_addr(core->pending_addr);
         
+        // Issue the command on the bus
         g_bus.origid = core->id;
         g_bus.cmd = core->pending_bus_cmd;
         g_bus.addr = block_addr;
@@ -825,7 +951,7 @@ static void process_bus_transactions(void) {
         int mod_owner = find_modified_owner(block_addr, core->id);
         
         if (mod_owner >= 0) {
-            /* Another cache will provide the data */
+            /* Another cache will provide the data (cache-to-cache transfer) */
             g_bus.flush_origid = mod_owner;
             g_bus.shared = 1;
             g_bus.sampled_shared = 1;
@@ -833,7 +959,7 @@ static void process_bus_transactions(void) {
         } else {
             /* Main memory will provide the data */
             g_bus.flush_origid = BUS_ORIGID_MEM;
-            g_bus.delay_counter = MEM_LATENCY - 1;
+            g_bus.delay_counter = MEM_LATENCY - 1;  // First word takes 16 cycles
         }
         
         g_bus.busy = true;
@@ -845,24 +971,36 @@ static void process_bus_transactions(void) {
  * SIMULATION MAIN LOOP
  * ============================================================================ */
 
+/**
+ * Initialize a core to default state
+ */
 static void init_core(Core *core, int id) {
     memset(core, 0, sizeof(Core));
     core->id = id;
 }
 
+/**
+ * Check if all cores are done and pipelines are empty
+ */
 static bool all_cores_done(void) {
     for (int i = 0; i < NUM_CORES; i++) {
+        // Check if core is still running or has instructions in pipeline
         if (!g_cores[i].halted) return false;
         if (g_cores[i].if_id.valid) return false;
         if (g_cores[i].id_ex.valid) return false;
         if (g_cores[i].ex_mem.valid) return false;
         if (g_cores[i].mem_wb.valid) return false;
     }
+    // Also check if bus is still busy
     if (g_bus.busy) return false;
     if (g_bus.writeback_in_progress) return false;
     return true;
 }
 
+/**
+ * Simulate one clock cycle for all cores
+ * Processes bus first, then pipeline stages in reverse order (WB -> Fetch)
+ */
 static void simulate_cycle(void) {
     /* Write trace at start of cycle (before any state changes) */
     for (int i = 0; i < NUM_CORES; i++) {
@@ -875,7 +1013,10 @@ static void simulate_cycle(void) {
     /* Write bus trace */
     write_bus_trace();
     
-    /* Save current pipeline state for proper stage advancement */
+    /* Save current pipeline state for proper stage advancement
+     * Need to save because we update in reverse order (WB -> Fetch)
+     * but each stage should see the state from START of cycle
+     */
     PipelineReg saved_if_id[NUM_CORES];
     PipelineReg saved_id_ex[NUM_CORES];
     PipelineReg saved_ex_mem[NUM_CORES];
@@ -912,6 +1053,7 @@ static void simulate_cycle(void) {
             core->halted = true;
         }
         
+        // Clear the WB stage
         core->mem_wb.valid = false;
     }
     
@@ -926,10 +1068,10 @@ static void simulate_cycle(void) {
             continue;
         }
         
-        /* Check if stalled on memory */
+        /* Check if stalled on memory access */
         if (core->stall_mem) {
             core->stats.mem_stall++;
-            continue;  /* Keep instruction in MEM */
+            continue;  /* Keep instruction in MEM stage */
         }
         
         Instruction *inst = &saved_ex_mem[i].inst;
@@ -939,11 +1081,11 @@ static void simulate_cycle(void) {
             uint32_t addr = saved_ex_mem[i].mem_addr;
             
             if (cache_has_block(&core->cache, addr)) {
-                /* Cache hit */
+                /* Cache hit - read the data */
                 core->stats.read_hit++;
                 result.alu_result = (int32_t)cache_read(&core->cache, addr);
             } else {
-                /* Cache miss */
+                /* Cache miss - need to fetch block from bus */
                 if (!core->cache_busy) {
                     core->stats.read_miss++;
                     core->cache_busy = true;
@@ -951,11 +1093,13 @@ static void simulate_cycle(void) {
                     core->pending_bus_cmd = BUS_RD;
                     core->pending_addr = addr;
                     
+                    // Check if we need to writeback current block first
                     if (cache_needs_writeback(&core->cache, addr)) {
                         core->need_writeback = true;
                         core->writeback_addr = cache_get_current_block_addr(&core->cache, addr);
                     }
                 }
+                // Stall pipeline until data arrives
                 core->stall_mem = true;
                 core->stall_decode = true;
                 core->stall_fetch = true;
@@ -970,12 +1114,12 @@ static void simulate_cycle(void) {
                 MesiState state = cache_get_state(&core->cache, addr);
                 
                 if (state == MESI_MODIFIED || state == MESI_EXCLUSIVE) {
-                    /* Cache hit - can write directly */
+                    /* Cache hit with write permission - can write directly */
                     core->stats.write_hit++;
                     cache_write(&core->cache, addr, data);
                     cache_set_state(&core->cache, addr, MESI_MODIFIED);
                 } else if (state == MESI_SHARED) {
-                    /* Need BusRdX to get exclusive access */
+                    /* Have the block but it's shared - need BusRdX for exclusive access */
                     if (!core->cache_busy) {
                         core->stats.write_miss++;
                         core->cache_busy = true;
@@ -993,7 +1137,7 @@ static void simulate_cycle(void) {
                     continue;
                 }
             } else {
-                /* Cache miss - need BusRdX */
+                /* Cache miss - need BusRdX to get block with write permission */
                 if (!core->cache_busy) {
                     core->stats.write_miss++;
                     core->cache_busy = true;
@@ -1004,6 +1148,7 @@ static void simulate_cycle(void) {
                     core->pending_store_addr = addr;
                     core->pending_store_data = data;
                     
+                    // Check if we need to writeback current block first
                     if (cache_needs_writeback(&core->cache, addr)) {
                         core->need_writeback = true;
                         core->writeback_addr = cache_get_current_block_addr(&core->cache, addr);
@@ -1017,7 +1162,7 @@ static void simulate_cycle(void) {
             }
         }
         
-        /* Advance to WB */
+        /* Advance to WB stage */
         core->mem_wb = result;
         core->ex_mem.valid = false;
     }
@@ -1027,7 +1172,7 @@ static void simulate_cycle(void) {
         Core *core = &g_cores[i];
         
         if (core->stall_mem) {
-            /* EX is also stalled */
+            /* EX is also stalled if MEM is stalled */
             continue;
         }
         
@@ -1041,6 +1186,7 @@ static void simulate_cycle(void) {
         int32_t rt_val = saved_id_ex[i].rt_val;
         int32_t result = 0;
         
+        // Perform ALU operation based on opcode
         switch (inst->opcode) {
             case OP_ADD:
                 result = rs_val + rt_val;
@@ -1064,25 +1210,26 @@ static void simulate_cycle(void) {
                 result = rs_val << (rt_val & 0x1F);
                 break;
             case OP_SRA:
-                result = rs_val >> (rt_val & 0x1F);
+                result = rs_val >> (rt_val & 0x1F);  // Arithmetic shift
                 break;
             case OP_SRL:
-                result = (int32_t)((uint32_t)rs_val >> (rt_val & 0x1F));
+                result = (int32_t)((uint32_t)rs_val >> (rt_val & 0x1F));  // Logical shift
                 break;
             case OP_JAL:
-                result = saved_id_ex[i].pc + 1;
+                result = saved_id_ex[i].pc + 1;  // Return address
                 break;
             case OP_LW:
             case OP_SW:
-                result = rs_val + rt_val;
+                result = rs_val + rt_val;  // Calculate memory address
                 break;
             default:
                 break;
         }
         
+        // Advance to MEM stage
         core->ex_mem = saved_id_ex[i];
         core->ex_mem.alu_result = result;
-        core->ex_mem.mem_addr = (uint32_t)result & 0x1FFFFF;
+        core->ex_mem.mem_addr = (uint32_t)result & 0x1FFFFF;  // Mask to 21 bits
         core->id_ex.valid = false;
     }
     
@@ -1091,6 +1238,7 @@ static void simulate_cycle(void) {
         Core *core = &g_cores[i];
         
         if (core->stall_mem) {
+            // Propagate stall from MEM
             core->stall_decode = true;
             core->stall_fetch = true;
             continue;
@@ -1108,8 +1256,9 @@ static void simulate_cycle(void) {
         /* Check for data hazards - must use SAVED registers (state at start of cycle) */
         bool has_hazard = false;
         
-        /* Check rs */
+        /* Check rs for hazard */
         if (inst->rs != 0 && inst->rs != 1) {
+            // Check if any later stage is writing to rs
             if (saved_id_ex[i].valid && saved_id_ex[i].writes_reg && saved_id_ex[i].dest_reg == inst->rs)
                 has_hazard = true;
             if (saved_ex_mem[i].valid && saved_ex_mem[i].writes_reg && saved_ex_mem[i].dest_reg == inst->rs)
@@ -1118,7 +1267,7 @@ static void simulate_cycle(void) {
                 has_hazard = true;
         }
         
-        /* Check rt */
+        /* Check rt for hazard */
         if (inst->rt != 0 && inst->rt != 1) {
             if (saved_id_ex[i].valid && saved_id_ex[i].writes_reg && saved_id_ex[i].dest_reg == inst->rt)
                 has_hazard = true;
@@ -1128,7 +1277,7 @@ static void simulate_cycle(void) {
                 has_hazard = true;
         }
         
-        /* Check rd for branches and stores */
+        /* Check rd for branches and stores (they read rd) */
         if ((is_branch(inst->opcode) || inst->opcode == OP_SW) && inst->rd != 0 && inst->rd != 1) {
             if (saved_id_ex[i].valid && saved_id_ex[i].writes_reg && saved_id_ex[i].dest_reg == inst->rd)
                 has_hazard = true;
@@ -1139,13 +1288,14 @@ static void simulate_cycle(void) {
         }
         
         if (has_hazard) {
+            // Stall decode and fetch until hazard is resolved
             core->stall_decode = true;
             core->stall_fetch = true;
             core->stats.decode_stall++;
             continue;
         }
         
-        /* No hazard - clear stalls */
+        /* No hazard - clear stalls and proceed */
         core->stall_decode = false;
         core->stall_fetch = false;
         
@@ -1157,7 +1307,7 @@ static void simulate_cycle(void) {
         int32_t rt_val = read_reg(core, inst->rt, inst->imm);
         int32_t rd_val = read_reg(core, inst->rd, inst->imm);
         
-        /* Handle branches in decode stage */
+        /* Handle branches in decode stage (early resolution) */
         bool take_branch = false;
         
         switch (inst->opcode) {
@@ -1188,16 +1338,16 @@ static void simulate_cycle(void) {
         
         if (take_branch) {
             core->branch_taken = true;
-            core->branch_target = rd_val & 0x3FF;
+            core->branch_target = rd_val & 0x3FF;  // Target address (10 bits)
         }
         
-        /* Prepare ID/EX */
+        /* Prepare ID/EX pipeline register */
         core->id_ex.inst = *inst;
         core->id_ex.pc = saved_if_id[i].pc;
         core->id_ex.rs_val = rs_val;
         core->id_ex.rt_val = rt_val;
         core->id_ex.rd_val = rd_val;
-        core->id_ex.mem_data = rd_val;
+        core->id_ex.mem_data = rd_val;  // For stores
         core->id_ex.valid = true;
         core->id_ex.writes_reg = writes_register(inst->opcode);
         core->id_ex.dest_reg = get_dest_reg(inst);
@@ -1212,11 +1362,11 @@ static void simulate_cycle(void) {
         if (core->halted) continue;
         
         if (core->stall_fetch) {
-            /* Keep IF/ID as is */
+            /* Keep IF/ID as is - don't fetch new instruction */
             continue;
         }
         
-        /* Fetch instruction */
+        /* Fetch instruction from IMEM */
         uint32_t raw = core->imem[core->pc & 0x3FF];
         
         core->if_id.inst = decode_instruction(raw);
@@ -1227,9 +1377,10 @@ static void simulate_cycle(void) {
         core->pc = (core->pc + 1) & 0x3FF;
     }
     
-    /* Apply branch targets AFTER fetch (this implements delay slot) */
-    /* The instruction at PC+1 (delay slot) was just fetched above */
-    /* Now we change PC to branch target for the NEXT fetch */
+    /* Apply branch targets AFTER fetch (to implement delay slot)
+     * The instruction at PC+1 (delay slot) was just fetched above
+     * Now we change PC to branch target for the NEXT fetch
+     */
     for (int i = 0; i < NUM_CORES; i++) {
         Core *core = &g_cores[i];
         if (core->branch_taken && !core->stall_fetch) {
@@ -1240,6 +1391,7 @@ static void simulate_cycle(void) {
     /* Update cycle counts */
     for (int i = 0; i < NUM_CORES; i++) {
         Core *core = &g_cores[i];
+        // Check if core is still active (running or draining pipeline)
         bool active = !core->halted || core->if_id.valid || core->id_ex.valid ||
                       core->ex_mem.valid || core->mem_wb.valid;
         if (active) {
@@ -1249,6 +1401,7 @@ static void simulate_cycle(void) {
     
     g_cycle++;
 }
+
 
 /* ============================================================================
  * MAIN FUNCTION
@@ -1306,17 +1459,17 @@ int main(int argc, char *argv[]) {
     /* Initialize main memory */
     load_main_mem(memin_file);
     
-    /* Initialize bus */
+    /* Initialize bus state */
     memset(&g_bus, 0, sizeof(g_bus));
     g_last_granted = NUM_CORES - 1;  /* Start with core 0 having highest priority */
     
-    /* Open trace files */
+    /* Open trace files for writing */
     for (int i = 0; i < NUM_CORES; i++) {
         g_trace_files[i] = fopen(trace_files[i], "w");
     }
     g_bus_trace = fopen(bustrace_file, "w");
     
-    /* Run simulation */
+    /* Run simulation until all cores halt and pipelines drain */
     g_cycle = 0;
     while (!all_cores_done()) {
         simulate_cycle();
