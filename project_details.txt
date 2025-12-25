@@ -38,7 +38,7 @@ CRITICAL DIFFERENCES FROM STANDARD MIPS:
 4. Delay slot IS used (instruction after branch ALWAYS executes)
 5. Register 1 ($imm) is special - contains sign-extended immediate, updated each decode
 6. Register 0 is hardwired to 0, writes are ignored
-7. PC is 10 bits (not 32), increments by 1 (not 4)
+7. PC is 10 bits, increments by 1 
 
 CRITICAL DIFFERENCES FROM STANDARD MESI:
 -----------------------------------------

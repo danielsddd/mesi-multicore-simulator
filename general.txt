@@ -10,3 +10,13 @@ run:
 clean directory:
 Remove-Item imem*.txt, memin.txt, memout.txt, regout*.txt, core*trace.txt, bustrace.txt, dsram*.txt, tsram*.txt, stats*.txt
 
+git add .
+
+git commit -m "Update docs folder"
+
+git push origin main
+
+# Pull the remote changes first Then push your changes
+git pull origin main 
+
+git push origin main
