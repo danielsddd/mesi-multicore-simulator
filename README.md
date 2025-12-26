@@ -1,1 +1,0 @@
-# mesi-multicore-simulator

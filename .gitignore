@@ -7,6 +7,15 @@
 *.obj
 *.elf
 
+*trace.txt
+memout.txt
+regout*.txt
+core*trace.txt
+bustrace.txt
+dsram*.txt
+tsram*.txt
+stats*.txt
+
 # Linker output
 *.ilk
 *.map

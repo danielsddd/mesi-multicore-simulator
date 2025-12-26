@@ -8,7 +8,7 @@ run:
 ./sim.exe
 
 clean directory:
-Remove-Item imem*.txt, memin.txt, memout.txt, regout*.txt, core*trace.txt, bustrace.txt, dsram*.txt, tsram*.txt, stats*.txt
+Remove-Item  memout.txt, regout*.txt, core*trace.txt, bustrace.txt, dsram*.txt, tsram*.txt, stats*.txt
 
 git add .
 
