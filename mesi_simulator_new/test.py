@@ -17,7 +17,7 @@ Tests Cover:
 - Pipeline hazard stress tests
 - Register integrity (R0 immutability, R1 immediate update)
 
-NOTES ON HALT BEHAVIOR (per teacher specification Dec 26, 2025):
+NOTES ON HALT BEHAVIOR:
 ================================================================
 When HALT reaches DECODE stage:
 1. The instruction currently in FETCH is DISCARDED (not executed)
@@ -28,8 +28,7 @@ This means the instruction at PC+1 is NOT executed for HALT (unlike branches whi
 Example files pad with HALTs for safety, but only the first HALT actually matters.
 
 NOTES ON MEMOUT:
-================
-Per teacher clarification (Dec 25, 2025):
+==========================================================
 "The simulator only simulates processor hardware, it doesn't make decisions
 on its own but only executes what the assembly program tells it. We will run
 tests that intentionally leave things in cache so they don't reach main memory,
