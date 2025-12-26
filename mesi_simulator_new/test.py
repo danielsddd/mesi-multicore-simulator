@@ -22,13 +22,24 @@ NOTES ON HALT BEHAVIOR:
 HALT stops fetching when it reaches WRITEBACK and sets halted=true.
 Instructions already in the pipeline WILL complete (pipeline drain).
 This is CORRECT behavior - example files pad with HALTs for this reason.
+All test programs should pad with multiple HALT instructions.
 
 NOTES ON MEMOUT:
 ================
-memout.txt reflects main memory state. With write-back policy, Modified
-cache lines only go to memory on eviction or bus snoop. If sim ends with
-Modified data still in cache, it may not appear in memout unless the
-implementation flushes all caches at the end.
+Per teacher clarification (Dec 25, 2025):
+"The simulator only simulates processor hardware, it doesn't make decisions
+on its own but only executes what the assembly program tells it. We will run
+tests that intentionally leave things in cache so they don't reach main memory,
+to verify the cache works correctly. If you do a flush, these tests will fail."
+
+Therefore:
+- memout.txt reflects ONLY data that was explicitly written back to main memory
+- Modified cache lines that were never evicted will NOT appear in memout.txt
+- Test programs must force conflict misses to write back data they want in memout.txt
+- To verify stored data, either:
+  1. Force eviction via conflict miss, then check memout.txt, OR
+  2. Read the data back via LW (which reads from cache), OR
+  3. Check dsram directly for cache contents
 """
 
 import os, sys, subprocess, tempfile, shutil, re
@@ -196,6 +207,10 @@ def read_tsram(filepath: str) -> List[Tuple[int, int]]:
             result.append(((val >> 12) & 0x3, val & 0xFFF))
     return result
 
+def read_dsram(filepath: str) -> List[int]:
+    """Read DSRAM (cache data) file."""
+    return [int(line, 16) for line in read_file(filepath) if line]
+
 def read_memout(filepath: str) -> List[int]:
     return [int(line, 16) for line in read_file(filepath) if line]
 
@@ -333,16 +348,14 @@ def test_load_store(suite: TestSuite):
         return
     test_dir = tempfile.mkdtemp(prefix="sim_ldst_")
     # Use a positive value that stays positive after sign extension
-    # 0x7FF = 2047 (max positive 12-bit), 0x100 = 256 (safely positive)
     imem = [pad_with_halts([encode_instruction(OP_ADD, 2, 0, 1, 0x100), encode_instruction(OP_SW, 2, 0, 1, 16),
                            encode_instruction(OP_LW, 3, 0, 1, 16)]),
             make_halt_only(), make_halt_only(), make_halt_only()]
     create_test_files(test_dir, imem)
     run_simulator(suite.sim_path, test_dir)
     regout = read_regout(os.path.join(test_dir, "regout0.txt"))
-    # 0x100 = 256, positive, no sign extension issue
     suite.add_result("Store source register correct", regout[0] == 256, f"r2={regout[0]}, expected 256")
-    suite.add_result("Load returns stored value", regout[1] == 256, f"r3={regout[1]}, expected 256")
+    suite.add_result("Load returns stored value (via cache)", regout[1] == 256, f"r3={regout[1]}, expected 256")
     shutil.rmtree(test_dir)
 
 def test_bus_and_latency(suite: TestSuite):
@@ -555,7 +568,7 @@ def test_load_word_variations(suite: TestSuite):
 def test_store_word_variations(suite: TestSuite):
     """Test SW instruction with various scenarios.
     NOTE: With write-back cache, Modified data stays in cache until eviction.
-    We verify the data is in the cache (dsram), not necessarily in memout.
+    We verify the data via LW (reads from cache), NOT via memout.txt.
     """
     print("\n[17] STORE WORD VARIATIONS")
     print("-" * 40)
@@ -786,22 +799,34 @@ def test_mesi_modified_flush(suite: TestSuite):
     shutil.rmtree(test_dir)
 
 def test_cache_eviction_writeback(suite: TestSuite):
+    """Test cache eviction causes writeback of Modified data.
+    This test DOES force eviction by writing to conflicting address (512),
+    so memout.txt SHOULD contain the written-back data.
+    """
     print("\n[28] CACHE EVICTION WRITEBACK TESTS")
     print("-" * 40)
     if not suite.sim_path:
         suite.add_result("Eviction tests", False, "No simulator binary")
         return
     test_dir = tempfile.mkdtemp(prefix="sim_evict_")
-    imem = [pad_with_halts([encode_instruction(OP_ADD, 2, 0, 1, 0xAB), encode_instruction(OP_SW, 2, 0, 1, 0),
-                           encode_instruction(OP_ADD, 3, 0, 1, 0xCD), encode_instruction(OP_ADD, 4, 0, 1, 512),
-                           encode_instruction(OP_SW, 3, 4, 0, 0), encode_instruction(OP_LW, 5, 0, 1, 0)]),
+    # Write 0xAB to address 0, then write to address 512 (same cache index, forces eviction)
+    # Then read from address 0 (should come from main memory after eviction)
+    imem = [pad_with_halts([
+        encode_instruction(OP_ADD, 2, 0, 1, 0xAB),
+        encode_instruction(OP_SW, 2, 0, 1, 0),           # Write 0xAB to addr 0 (Modified)
+        encode_instruction(OP_ADD, 3, 0, 1, 0xCD),
+        encode_instruction(OP_ADD, 4, 0, 1, 0x200),      # 512 = 0x200
+        encode_instruction(OP_SW, 3, 4, 0, 0),           # Write 0xCD to addr 512 (evicts addr 0 block)
+        encode_instruction(OP_LW, 5, 0, 1, 0)            # Read from addr 0 (now from memory)
+    ]),
             make_halt_only(), make_halt_only(), make_halt_only()]
     create_test_files(test_dir, imem)
     run_simulator(suite.sim_path, test_dir)
     regout = read_regout(os.path.join(test_dir, "regout0.txt"))
-    suite.add_result("Eviction writes back Modified data", regout[3] == 0xAB, f"r5={regout[3]}")
+    suite.add_result("Eviction writes back Modified data (verified via LW)", regout[3] == 0xAB, f"r5={regout[3]}")
+    # NOW we can check memout because eviction happened
     memout = read_memout(os.path.join(test_dir, "memout.txt"))
-    suite.add_result("Memory contains written back value", len(memout) > 0 and memout[0] == 0xAB,
+    suite.add_result("Memory contains evicted data", len(memout) > 0 and memout[0] == 0xAB,
                     f"mem[0]={memout[0] if memout else 'N/A'}")
     shutil.rmtree(test_dir)
 
@@ -958,6 +983,11 @@ def test_statistics_accuracy(suite: TestSuite):
     shutil.rmtree(test_dir)
 
 def test_four_core_contention(suite: TestSuite):
+    """Test 4 cores writing to same address.
+    NOTE: We do NOT check memout.txt here because the final Modified block
+    may still be in one core's cache (not evicted). We verify via bus trace
+    that proper MESI protocol was followed.
+    """
     print("\n[36] FOUR-CORE CONTENTION TESTS")
     print("-" * 40)
     if not suite.sim_path:
@@ -971,9 +1001,15 @@ def test_four_core_contention(suite: TestSuite):
     bus_trace = parse_bus_trace(os.path.join(test_dir, "bustrace.txt"))
     cores_with_busrdx = set(t['origid'] for t in bus_trace if t['cmd'] == 2)
     suite.add_result("Multiple cores issue BusRdX", len(cores_with_busrdx) >= 2, f"Cores: {cores_with_busrdx}")
-    memout = read_memout(os.path.join(test_dir, "memout.txt"))
-    suite.add_result("Final memory has valid value", memout and memout[0] in [100, 200, 300, 400],
-                    f"mem[0]={memout[0] if memout else 'N/A'}")
+    # Check that simulation completed successfully (all cores reached halt)
+    all_stats = [parse_stats(os.path.join(test_dir, f"stats{i}.txt")) for i in range(4)]
+    all_halted = all(s.get('cycles', 0) > 0 for s in all_stats)
+    suite.add_result("All cores completed execution", all_halted, "Some cores didn't complete")
+    # Verify data is in SOME cache (dsram) - the "winning" core has it
+    dsrams = [read_dsram(os.path.join(test_dir, f"dsram{i}.txt")) for i in range(4)]
+    valid_values = [100, 200, 300, 400]
+    found_value = any(dsram[0] in valid_values for dsram in dsrams if dsram)
+    suite.add_result("Final value in cache", found_value, "No valid value found in any cache")
     shutil.rmtree(test_dir)
 
 def test_jal_return(suite: TestSuite):
@@ -1057,6 +1093,40 @@ def test_memory_boundary_addresses(suite: TestSuite):
     suite.add_result("Load from end of block 1", regout[2] == 15, f"got {regout[2]}")
     shutil.rmtree(test_dir)
 
+def test_modified_not_in_memout(suite: TestSuite):
+    """Test that Modified cache data does NOT appear in memout.txt without eviction.
+    This verifies the simulator does NOT auto-flush at end (per teacher clarification).
+    """
+    print("\n[41] MODIFIED DATA NOT AUTO-FLUSHED TESTS")
+    print("-" * 40)
+    if not suite.sim_path:
+        suite.add_result("No auto-flush tests", False, "No simulator binary")
+        return
+    test_dir = tempfile.mkdtemp(prefix="sim_noflush_")
+    # Write to address 0, do NOT force eviction
+    imem = [pad_with_halts([
+        encode_instruction(OP_ADD, 2, 0, 1, 0x42),
+        encode_instruction(OP_SW, 2, 0, 1, 0),  # Write 0x42 to addr 0 (Modified, no eviction)
+    ]),
+            make_halt_only(), make_halt_only(), make_halt_only()]
+    create_test_files(test_dir, imem, ["00000000"])  # Initial memory has 0
+    run_simulator(suite.sim_path, test_dir)
+    
+    # Verify data is in cache (tsram shows Modified, dsram has the value)
+    tsram = read_tsram(os.path.join(test_dir, "tsram0.txt"))
+    dsram = read_dsram(os.path.join(test_dir, "dsram0.txt"))
+    suite.add_result("Cache is in Modified state", tsram[0][0] == 3, f"MESI state={tsram[0][0]}")
+    suite.add_result("Cache contains written value", dsram[0] == 0x42, f"dsram[0]={dsram[0]}")
+    
+    # Verify memout does NOT have the value (since no eviction happened)
+    memout = read_memout(os.path.join(test_dir, "memout.txt"))
+    # memout might be empty or have the original 0
+    memout_val = memout[0] if memout else 0
+    suite.add_result("memout does NOT have Modified data (no auto-flush)", 
+                    memout_val != 0x42,
+                    f"memout[0]={memout_val} (should NOT be 0x42)")
+    shutil.rmtree(test_dir)
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -1130,6 +1200,7 @@ def main():
     test_shift_edge_cases(suite)
     test_branch_target_10_bits(suite)
     test_memory_boundary_addresses(suite)
+    test_modified_not_in_memout(suite)  # NEW TEST
     
     success = suite.summary()
     
