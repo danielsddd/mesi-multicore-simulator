@@ -17,12 +17,15 @@ Tests Cover:
 - Pipeline hazard stress tests
 - Register integrity (R0 immutability, R1 immediate update)
 
-NOTES ON HALT BEHAVIOR:
-=======================
-HALT stops fetching when it reaches WRITEBACK and sets halted=true.
-Instructions already in the pipeline WILL complete (pipeline drain).
-This is CORRECT behavior - example files pad with HALTs for this reason.
-All test programs should pad with multiple HALT instructions.
+NOTES ON HALT BEHAVIOR (per teacher specification Dec 26, 2025):
+================================================================
+When HALT reaches DECODE stage:
+1. The instruction currently in FETCH is DISCARDED (not executed)
+2. HALT continues through pipeline (EX -> MEM -> WB)
+3. Core stops when HALT reaches WB
+
+This means the instruction at PC+1 is NOT executed for HALT (unlike branches which have delay slot).
+Example files pad with HALTs for safety, but only the first HALT actually matters.
 
 NOTES ON MEMOUT:
 ================
@@ -875,10 +878,9 @@ def test_consecutive_loads_same_block(suite: TestSuite):
     shutil.rmtree(test_dir)
 
 def test_halt_behavior(suite: TestSuite):
-    """Test that HALT properly stops core after pipeline drains.
-    NOTE: When HALT is fetched, subsequent instructions may already be in pipeline.
-    These instructions WILL complete (pipeline drain) - this is correct behavior.
-    Example files pad with HALTs for exactly this reason.
+    """Test that HALT properly stops core and discards instruction in FETCH.
+    Per teacher spec (Dec 26, 2025): When HALT reaches DECODE, the instruction
+    currently in FETCH is DISCARDED. HALT then flows to WB before core stops.
     """
     print("\n[31] HALT BEHAVIOR TESTS")
     print("-" * 40)
@@ -886,8 +888,8 @@ def test_halt_behavior(suite: TestSuite):
         suite.add_result("HALT tests", False, "No simulator binary")
         return
     test_dir = tempfile.mkdtemp(prefix="sim_halt_")
-    # Test that HALT eventually stops execution
-    # Use multiple HALTs to ensure clean termination
+    
+    # Test 1: Basic HALT terminates
     imem = [[encode_instruction(OP_ADD, 2, 0, 1, 42),
              encode_instruction(OP_HALT, 0, 0, 0, 0),
              encode_instruction(OP_HALT, 0, 0, 0, 0),
@@ -904,6 +906,33 @@ def test_halt_behavior(suite: TestSuite):
     suite.add_result("Simulation terminates", stats.get('cycles', 0) > 0 and stats.get('cycles', 0) < 100,
                     f"cycles={stats.get('cycles')}")
     shutil.rmtree(test_dir)
+    
+    # Test 2: HALT discards instruction in FETCH (per teacher spec)
+    # PC=0: ADD r2, r0, r1, 42    -> r2 = 42 (executes)
+    # PC=1: HALT                   -> when in DECODE, discards PC=2
+    # PC=2: ADD r3, r0, r1, 100   -> SHOULD BE DISCARDED (in FETCH when HALT in DECODE)
+    # PC=3+: HALTs padding
+    test_dir2 = tempfile.mkdtemp(prefix="sim_halt_discard_")
+    imem2 = [[encode_instruction(OP_ADD, 2, 0, 1, 42),      # PC=0
+              encode_instruction(OP_HALT, 0, 0, 0, 0),      # PC=1
+              encode_instruction(OP_ADD, 3, 0, 1, 100),     # PC=2 - should be DISCARDED
+              encode_instruction(OP_ADD, 4, 0, 1, 200)] +   # PC=3 - definitely not executed
+             [encode_instruction(OP_HALT, 0, 0, 0, 0)] * HALT_PAD,
+             make_halt_only(), make_halt_only(), make_halt_only()]
+    create_test_files(test_dir2, imem2)
+    run_simulator(suite.sim_path, test_dir2)
+    regout2 = read_regout(os.path.join(test_dir2, "regout0.txt"))
+    
+    # r2 should be 42 (instruction before HALT)
+    suite.add_result("Instruction before HALT executes (discard test)", regout2[0] == 42, 
+                    f"r2={regout2[0]}, expected 42")
+    # r3 should be 0 (instruction in FETCH when HALT in DECODE is DISCARDED)
+    suite.add_result("HALT discards instruction in FETCH", regout2[1] == 0, 
+                    f"r3={regout2[1]}, expected 0 (discarded)")
+    # r4 should be 0 (never fetched)
+    suite.add_result("Instructions after discarded not executed", regout2[2] == 0, 
+                    f"r4={regout2[2]}, expected 0")
+    shutil.rmtree(test_dir2)
 
 def test_sign_extension_negative_immediate(suite: TestSuite):
     print("\n[32] SIGN EXTENSION TESTS")
