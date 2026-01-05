@@ -29,6 +29,15 @@
 #define NUM_CACHE_BLOCKS    64          /* 512 / 8 */
 #define MEM_LATENCY         16          /* cycles for first word */
 
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#else
+#define STATIC_ASSERT(cond, msg) typedef char static_assertion_##__LINE__[(cond) ? 1 : -1]
+#endif
+
+STATIC_ASSERT(BLOCK_SIZE == 8, "BLOCK_SIZE must be 8 words");
+STATIC_ASSERT(NUM_CACHE_BLOCKS == 64, "NUM_CACHE_BLOCKS must be 64 lines");
+
 /* ============================================================================
  * OPCODE DEFINITIONS
  * ============================================================================ */
@@ -125,6 +134,7 @@ typedef struct {
     int      origid;
     BusCmd   cmd;
     uint32_t addr;
+    uint32_t request_word_addr; /* Requested word address for BusRd/BusRdX trace */
     uint32_t data;
     int      shared;  // Set to 1 if block exists in multiple caches
     
@@ -664,18 +674,16 @@ static int arbitrate_bus(bool requests[NUM_CORES]) {
  * Check if any cache has the block and set bus_shared accordingly
  * Used when issuing BusRd to determine if block is shared
  */
-static void snoop_and_set_shared(uint32_t addr, int requesting_core) {
-    g_bus.shared = 0;
-    
+static int snoop_and_get_shared(uint32_t addr, int requesting_core) {
     for (int i = 0; i < NUM_CORES; i++) {
         if (i == requesting_core) continue;
         
         Cache *cache = &g_cores[i].cache;
         if (cache_has_block(cache, addr)) {
-            g_bus.shared = 1;
-            break;
+            return 1;
         }
     }
+    return 0;
 }
 
 /**
@@ -809,23 +817,10 @@ static void process_bus_transactions(void) {
             return;
         }
         
-        /* Transfer next word */
+        /* Transfer next word from the snapshotted block */
         int word_idx = g_bus.words_transferred;
         uint32_t word_addr = g_bus.original_addr + word_idx;
-        
-        if (g_bus.flush_origid == BUS_ORIGID_MEM) {
-            /* Reading from main memory */
-            g_bus.block_buffer[word_idx] = g_main_mem[word_addr];
-            g_bus.data = g_bus.block_buffer[word_idx];
-        } else {
-            /* Reading from another cache (Modified) */
-            Core *src_core = &g_cores[g_bus.flush_origid];
-            g_bus.block_buffer[word_idx] = cache_read(&src_core->cache, word_addr);
-            g_bus.data = g_bus.block_buffer[word_idx];
-            
-            /* Also update main memory */
-            g_main_mem[word_addr] = g_bus.data;
-        }
+        g_bus.data = g_bus.block_buffer[word_idx];
         
         /* Set bus state for trace */
         g_bus.cmd = BUS_FLUSH;
@@ -928,11 +923,13 @@ static void process_bus_transactions(void) {
     } else {
         /* Initiate BusRd or BusRdX */
         uint32_t block_addr = get_block_addr(core->pending_addr);
+        uint32_t request_addr = core->pending_addr & 0x1FFFFF;
         
-        // Issue the command on the bus
+        /* Issue the command on the bus (trace uses requested word address) */
         g_bus.origid = core->id;
         g_bus.cmd = core->pending_bus_cmd;
-        g_bus.addr = block_addr;
+        g_bus.request_word_addr = request_addr;
+        g_bus.addr = request_addr;
         g_bus.data = 0;
         g_bus.requesting_core = core->id;
         g_bus.original_cmd = core->pending_bus_cmd;
@@ -940,9 +937,9 @@ static void process_bus_transactions(void) {
         
         core->waiting_for_bus = false;
         
-        /* Snoop: set bus_shared and sample it NOW */
-        snoop_and_set_shared(block_addr, core->id);
-        g_bus.sampled_shared = g_bus.shared;
+        /* Snoop: sample bus_shared (bus line stays 0 for BusRd/BusRdX) */
+        g_bus.shared = 0;
+        g_bus.sampled_shared = snoop_and_get_shared(block_addr, core->id);
         
         /* Update states of snooping caches */
         snoop_update_states(block_addr, core->pending_bus_cmd, core->id);
@@ -960,6 +957,20 @@ static void process_bus_transactions(void) {
             /* Main memory will provide the data */
             g_bus.flush_origid = BUS_ORIGID_MEM;
             g_bus.delay_counter = MEM_LATENCY - 1;  // First word takes 16 cycles
+        }
+        
+        /* Snapshot full block at start of transaction */
+        if (g_bus.flush_origid == BUS_ORIGID_MEM) {
+            for (int i = 0; i < BLOCK_SIZE; i++) {
+                g_bus.block_buffer[i] = g_main_mem[block_addr + i];
+            }
+        } else {
+            Core *src_core = &g_cores[g_bus.flush_origid];
+            for (int i = 0; i < BLOCK_SIZE; i++) {
+                uint32_t word_addr = block_addr + i;
+                g_bus.block_buffer[i] = cache_read(&src_core->cache, word_addr);
+                g_main_mem[word_addr] = g_bus.block_buffer[i];
+            }
         }
         
         g_bus.busy = true;
@@ -1185,42 +1196,54 @@ static void simulate_cycle(void) {
         int32_t rs_val = saved_id_ex[i].rs_val;
         int32_t rt_val = saved_id_ex[i].rt_val;
         int32_t result = 0;
+        uint32_t urs = (uint32_t)rs_val;
+        uint32_t urt = (uint32_t)rt_val;
+        uint32_t ures = 0;
         
         // Perform ALU operation based on opcode
         switch (inst->opcode) {
             case OP_ADD:
-                result = rs_val + rt_val;
+                ures = urs + urt;
+                result = (int32_t)ures;
                 break;
             case OP_SUB:
-                result = rs_val - rt_val;
+                ures = urs - urt;
+                result = (int32_t)ures;
                 break;
             case OP_AND:
-                result = rs_val & rt_val;
+                ures = urs & urt;
+                result = (int32_t)ures;
                 break;
             case OP_OR:
-                result = rs_val | rt_val;
+                ures = urs | urt;
+                result = (int32_t)ures;
                 break;
             case OP_XOR:
-                result = rs_val ^ rt_val;
+                ures = urs ^ urt;
+                result = (int32_t)ures;
                 break;
             case OP_MUL:
-                result = rs_val * rt_val;
+                ures = urs * urt;
+                result = (int32_t)ures;
                 break;
             case OP_SLL:
-                result = rs_val << (rt_val & 0x1F);
+                ures = urs << (urt & 0x1F);
+                result = (int32_t)ures;
                 break;
             case OP_SRA:
                 result = rs_val >> (rt_val & 0x1F);  // Arithmetic shift
                 break;
             case OP_SRL:
-                result = (int32_t)((uint32_t)rs_val >> (rt_val & 0x1F));  // Logical shift
+                ures = urs >> (urt & 0x1F);
+                result = (int32_t)ures;
                 break;
             case OP_JAL:
                 result = saved_id_ex[i].pc + 1;  // Return address
                 break;
             case OP_LW:
             case OP_SW:
-                result = rs_val + rt_val;  // Calculate memory address
+                ures = urs + urt;  // Calculate memory address
+                result = (int32_t)ures;
                 break;
             default:
                 break;
