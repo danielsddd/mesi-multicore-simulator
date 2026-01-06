@@ -115,6 +115,7 @@ typedef struct {
     bool        valid;       // Is this stage active?
     bool        writes_reg;  // Does instruction write to a register?
     uint8_t     dest_reg;    // Which register is being written?
+    bool        cache_op_done;  // Track if cache hit/miss already counted
 } PipelineReg;
 
 /**
@@ -200,6 +201,7 @@ typedef struct {
     /* Cache transaction state */
     bool         cache_busy;         // Cache is waiting for bus transaction
     bool         waiting_for_bus;    // Waiting for bus access
+    bool         bus_request_ready;  // FIX: Bus request is ready to be processed (1 cycle delay)
     BusCmd       pending_bus_cmd;    // Command to issue when bus granted
     uint32_t     pending_addr;       // Address for pending request
     bool         need_writeback;     // Need to writeback before fetch
@@ -209,6 +211,10 @@ typedef struct {
     bool         pending_store;      // Store waiting to complete after fill
     uint32_t     pending_store_addr; // Address for pending store
     uint32_t     pending_store_data; // Data for pending store
+    
+    /* For tracking load data when cache fill completes */
+    bool         load_data_ready;    // Load data is ready in alu_result
+    int32_t      load_result;        // The loaded data
     
     Stats        stats;
 } Core;
@@ -293,22 +299,21 @@ static uint32_t get_tsram_tag(uint32_t tsram_entry) {
  * Create TSRAM entry from MESI state and tag
  * Packs both into a single 32-bit word
  */
-static uint32_t make_tsram_entry(MesiState mesi, uint32_t tag) {
-    return ((uint32_t)mesi << 12) | (tag & 0xFFF);
+static uint32_t make_tsram_entry(MesiState state, uint32_t tag) {
+    return ((uint32_t)state << 12) | (tag & 0xFFF);
 }
 
 /**
- * Decode a 32-bit instruction word into its components
- * Extracts opcode, registers, and immediate value
+ * Decode 32-bit instruction word into fields
  */
 static Instruction decode_instruction(uint32_t raw) {
     Instruction inst;
-    inst.raw    = raw;
+    inst.raw = raw;
     inst.opcode = (raw >> 24) & 0xFF;
-    inst.rd     = (raw >> 20) & 0xF;
-    inst.rs     = (raw >> 16) & 0xF;
-    inst.rt     = (raw >> 12) & 0xF;
-    inst.imm    = sign_extend_12(raw & 0xFFF);
+    inst.rd = (raw >> 20) & 0xF;
+    inst.rs = (raw >> 16) & 0xF;
+    inst.rt = (raw >> 12) & 0xF;
+    inst.imm = sign_extend_12(raw & 0xFFF);
     return inst;
 }
 
@@ -323,40 +328,39 @@ static bool is_branch(uint8_t opcode) {
  * Check if instruction writes to a register
  */
 static bool writes_register(uint8_t opcode) {
-    return opcode <= OP_SRL || opcode == OP_JAL || opcode == OP_LW;
+    switch (opcode) {
+        case OP_ADD: case OP_SUB: case OP_AND: case OP_OR:
+        case OP_XOR: case OP_MUL: case OP_SLL: case OP_SRA:
+        case OP_SRL: case OP_JAL: case OP_LW:
+            return true;
+        default:
+            return false;
+    }
 }
 
 /**
- * Get destination register for an instruction
- * JAL always writes to R15, others use rd field
+ * Get destination register for instruction
+ * JAL writes to R15, others use rd field
  */
 static uint8_t get_dest_reg(Instruction *inst) {
-    if (inst->opcode == OP_JAL) {
-        return 15;  /* jal always writes to R15 */
-    }
-    if (writes_register(inst->opcode)) {
-        return inst->rd;
-    }
-    return 0;  /* No destination */
+    if (inst->opcode == OP_JAL) return 15;
+    return inst->rd;
 }
 
 /* ============================================================================
- * FILE I/O FUNCTIONS
+ * FILE I/O
  * ============================================================================ */
 
 /**
  * Load instruction memory from file
- * Each line is a 32-bit hex instruction
  */
 static void load_imem(const char *filename, uint32_t *imem) {
     FILE *f = fopen(filename, "r");
-    memset(imem, 0, IMEM_SIZE * sizeof(uint32_t));
-    
     if (!f) return;
     
-    char line[64];
+    char line[32];
     int addr = 0;
-    while (addr < IMEM_SIZE && fgets(line, sizeof(line), f)) {
+    while (fgets(line, sizeof(line), f) && addr < IMEM_SIZE) {
         imem[addr++] = (uint32_t)strtoul(line, NULL, 16);
     }
     
@@ -365,17 +369,14 @@ static void load_imem(const char *filename, uint32_t *imem) {
 
 /**
  * Load main memory from file
- * Each line is a 32-bit hex word
  */
 static void load_main_mem(const char *filename) {
     FILE *f = fopen(filename, "r");
-    memset(g_main_mem, 0, sizeof(g_main_mem));
-    
     if (!f) return;
     
-    char line[64];
+    char line[32];
     int addr = 0;
-    while (addr < MAIN_MEM_SIZE && fgets(line, sizeof(line), f)) {
+    while (fgets(line, sizeof(line), f) && addr < MAIN_MEM_SIZE) {
         g_main_mem[addr++] = (uint32_t)strtoul(line, NULL, 16);
     }
     
@@ -383,8 +384,7 @@ static void load_main_mem(const char *filename) {
 }
 
 /**
- * Write main memory to file at end of simulation
- * Only writes up to last non-zero word to save space
+ * Write main memory to file
  */
 static void write_main_mem(const char *filename) {
     FILE *f = fopen(filename, "w");
@@ -393,9 +393,7 @@ static void write_main_mem(const char *filename) {
     /* Find last non-zero word */
     int last = 0;
     for (int i = 0; i < MAIN_MEM_SIZE; i++) {
-        if (g_main_mem[i] != 0) {
-            last = i;
-        }
+        if (g_main_mem[i] != 0) last = i;
     }
     
     /* Write up to and including last non-zero word */
@@ -476,10 +474,11 @@ static void write_stats(const char *filename, Core *core) {
 /**
  * Write core pipeline trace for current cycle
  * Shows which instruction is in each pipeline stage and register values
+ * Returns true if trace was written (core was active)
  */
-static void write_core_trace(Core *core) {
+static bool write_core_trace(Core *core) {
     FILE *f = g_trace_files[core->id];
-    if (!f) return;
+    if (!f) return false;
     
     /* Determine activity of each stage */
     bool fetch_active = !core->halted;
@@ -491,12 +490,12 @@ static void write_core_trace(Core *core) {
     bool any_active = fetch_active || decode_active || exec_active || mem_active || wb_active;
     
     // Don't write trace if no stages are active
-    if (!any_active) return;
+    if (!any_active) return false;
     
     fprintf(f, "%d ", g_cycle);
     
-    /* Fetch stage - PC being fetched this cycle */
-    if (fetch_active && !core->stall_fetch) {
+    /* FIX: Fetch stage - show PC even when stalled (as long as core not halted) */
+    if (fetch_active) {
         fprintf(f, "%03X ", core->pc & 0x3FF);
     } else {
         fprintf(f, "--- ");
@@ -536,6 +535,7 @@ static void write_core_trace(Core *core) {
         if (i < NUM_REGISTERS - 1) fprintf(f, " ");
     }
     fprintf(f, "\n");
+    return true;
 }
 
 /**
@@ -852,6 +852,13 @@ static void process_bus_transactions(void) {
                 req_core->pending_store = false;
             }
             
+            /* If this was a load, read the data now and mark it ready */
+            if (g_bus.original_cmd == BUS_RD && req_core->ex_mem.valid && 
+                req_core->ex_mem.inst.opcode == OP_LW) {
+                req_core->load_data_ready = true;
+                req_core->load_result = (int32_t)cache_read(&req_core->cache, req_core->ex_mem.mem_addr);
+            }
+            
             /* If source was Modified cache, update its state */
             if (g_bus.flush_origid != BUS_ORIGID_MEM) {
                 Core *src_core = &g_cores[g_bus.flush_origid];
@@ -875,13 +882,16 @@ static void process_bus_transactions(void) {
     }
     
     /* Check for new bus requests from cores */
+    /* FIX: Only consider requests that are ready (after 1 cycle delay) */
     bool requests[NUM_CORES] = {false};
     
     for (int i = 0; i < NUM_CORES; i++) {
         Core *core = &g_cores[i];
         
-        /* Request bus if need writeback or waiting for data */
-        if (core->need_writeback || core->waiting_for_bus) {
+        /* Request bus if need writeback or waiting for data AND request is ready */
+        if (core->need_writeback && core->bus_request_ready) {
+            requests[i] = true;
+        } else if (core->waiting_for_bus && core->bus_request_ready) {
             requests[i] = true;
         }
     }
@@ -936,6 +946,7 @@ static void process_bus_transactions(void) {
         g_bus.original_addr = block_addr;
         
         core->waiting_for_bus = false;
+        core->bus_request_ready = false;  /* FIX: Clear the ready flag */
         
         /* Snoop: sample bus_shared (bus line stays 0 for BusRd/BusRdX) */
         g_bus.shared = 0;
@@ -950,7 +961,7 @@ static void process_bus_transactions(void) {
         if (mod_owner >= 0) {
             /* Another cache will provide the data (cache-to-cache transfer) */
             g_bus.flush_origid = mod_owner;
-            g_bus.shared = 1;
+            /* Note: shared stays 0 on BusRd line per spec; sampled_shared used for Flush */
             g_bus.sampled_shared = 1;
             g_bus.delay_counter = 0;  /* No delay for cache-to-cache */
         } else {
@@ -1013,16 +1024,42 @@ static bool all_cores_done(void) {
  * Processes bus first, then pipeline stages in reverse order (WB -> Fetch)
  */
 static void simulate_cycle(void) {
-    /* Write trace at start of cycle (before any state changes) */
+    /* Write trace at start of cycle (before any state changes) 
+     * Track which cores wrote a trace (were active) this cycle
+     */
+    bool core_was_active[NUM_CORES];
     for (int i = 0; i < NUM_CORES; i++) {
-        write_core_trace(&g_cores[i]);
+        core_was_active[i] = write_core_trace(&g_cores[i]);
     }
     
-    /* Process bus transactions first */
+    /* Count mem_stall BEFORE bus processing clears the stall
+     * This ensures we count the cycle when data arrives but instruction
+     * was still waiting at the start of the cycle */
+    for (int i = 0; i < NUM_CORES; i++) {
+        Core *core = &g_cores[i];
+        if (core->stall_mem && core->ex_mem.valid) {
+            core->stats.mem_stall++;
+        }
+    }
+    
+    /* Process bus transactions */
     process_bus_transactions();
     
     /* Write bus trace */
     write_bus_trace();
+    
+    /* FIX: Advance bus_request_ready AFTER bus processing
+     * This implements the 2-cycle delay between cache miss detection and bus request:
+     * Cycle N: Miss detected, waiting_for_bus=true, bus_request_ready=false
+     * Cycle N+1: process_bus sees ready=false (no BusRd), then we set ready=true here
+     * Cycle N+2: process_bus sees ready=true, issues BusRd
+     */
+    for (int i = 0; i < NUM_CORES; i++) {
+        Core *core = &g_cores[i];
+        if ((core->waiting_for_bus || core->need_writeback) && !core->bus_request_ready) {
+            core->bus_request_ready = true;
+        }
+    }
     
     /* Save current pipeline state for proper stage advancement
      * Need to save because we update in reverse order (WB -> Fetch)
@@ -1049,10 +1086,8 @@ static void simulate_cycle(void) {
         
         Instruction *inst = &saved_mem_wb[i].inst;
         
-        /* Count executed instructions (not halts) */
-        if (inst->opcode != OP_HALT) {
-            core->stats.instructions++;
-        }
+        /* Count ALL executed instructions including HALT */
+        core->stats.instructions++;
         
         /* Write result to register file */
         if (saved_mem_wb[i].writes_reg) {
@@ -1081,7 +1116,7 @@ static void simulate_cycle(void) {
         
         /* Check if stalled on memory access */
         if (core->stall_mem) {
-            core->stats.mem_stall++;
+            /* mem_stall already counted at start of cycle */
             continue;  /* Keep instruction in MEM stage */
         }
         
@@ -1091,9 +1126,16 @@ static void simulate_cycle(void) {
         if (inst->opcode == OP_LW) {
             uint32_t addr = saved_ex_mem[i].mem_addr;
             
-            if (cache_has_block(&core->cache, addr)) {
-                /* Cache hit - read the data */
-                core->stats.read_hit++;
+            /* Check if data was just loaded by bus transaction */
+            if (core->load_data_ready) {
+                result.alu_result = core->load_result;
+                core->load_data_ready = false;
+                /* Don't count hit - we already counted miss when we started */
+            } else if (cache_has_block(&core->cache, addr)) {
+                /* Cache hit - but only count if we didn't just fill the cache */
+                if (!saved_ex_mem[i].cache_op_done) {
+                    core->stats.read_hit++;
+                }
                 result.alu_result = (int32_t)cache_read(&core->cache, addr);
             } else {
                 /* Cache miss - need to fetch block from bus */
@@ -1101,8 +1143,12 @@ static void simulate_cycle(void) {
                     core->stats.read_miss++;
                     core->cache_busy = true;
                     core->waiting_for_bus = true;
+                    core->bus_request_ready = false;  /* FIX: Not ready yet, needs 1 cycle */
                     core->pending_bus_cmd = BUS_RD;
                     core->pending_addr = addr;
+                    
+                    /* Mark that we already counted the miss */
+                    core->ex_mem.cache_op_done = true;
                     
                     // Check if we need to writeback current block first
                     if (cache_needs_writeback(&core->cache, addr)) {
@@ -1114,7 +1160,6 @@ static void simulate_cycle(void) {
                 core->stall_mem = true;
                 core->stall_decode = true;
                 core->stall_fetch = true;
-                core->stats.mem_stall++;
                 continue;
             }
         } else if (inst->opcode == OP_SW) {
@@ -1125,18 +1170,26 @@ static void simulate_cycle(void) {
                 MesiState state = cache_get_state(&core->cache, addr);
                 
                 if (state == MESI_MODIFIED || state == MESI_EXCLUSIVE) {
-                    /* Cache hit with write permission - can write directly */
-                    core->stats.write_hit++;
+                    /* Can write directly (Exclusive silently becomes Modified) */
+                    if (!saved_ex_mem[i].cache_op_done) {
+                        core->stats.write_hit++;
+                    }
                     cache_write(&core->cache, addr, data);
                     cache_set_state(&core->cache, addr, MESI_MODIFIED);
-                } else if (state == MESI_SHARED) {
-                    /* Have the block but it's shared - need BusRdX for exclusive access */
+                } else {
+                    /* Shared state - need BusRdX to get exclusive access */
                     if (!core->cache_busy) {
                         core->stats.write_miss++;
                         core->cache_busy = true;
                         core->waiting_for_bus = true;
+                        core->bus_request_ready = false;  /* FIX: Not ready yet */
                         core->pending_bus_cmd = BUS_RDX;
                         core->pending_addr = addr;
+                        
+                        /* Mark operation done */
+                        core->ex_mem.cache_op_done = true;
+                        
+                        /* Store the data to write after getting exclusive access */
                         core->pending_store = true;
                         core->pending_store_addr = addr;
                         core->pending_store_data = data;
@@ -1144,22 +1197,27 @@ static void simulate_cycle(void) {
                     core->stall_mem = true;
                     core->stall_decode = true;
                     core->stall_fetch = true;
-                    core->stats.mem_stall++;
                     continue;
                 }
             } else {
-                /* Cache miss - need BusRdX to get block with write permission */
+                /* Cache miss for write - write allocate policy */
                 if (!core->cache_busy) {
                     core->stats.write_miss++;
                     core->cache_busy = true;
                     core->waiting_for_bus = true;
+                    core->bus_request_ready = false;  /* FIX: Not ready yet */
                     core->pending_bus_cmd = BUS_RDX;
                     core->pending_addr = addr;
+                    
+                    /* Mark operation done */
+                    core->ex_mem.cache_op_done = true;
+                    
+                    /* Store data for later */
                     core->pending_store = true;
                     core->pending_store_addr = addr;
                     core->pending_store_data = data;
                     
-                    // Check if we need to writeback current block first
+                    // Check if writeback needed
                     if (cache_needs_writeback(&core->cache, addr)) {
                         core->need_writeback = true;
                         core->writeback_addr = cache_get_current_block_addr(&core->cache, addr);
@@ -1168,7 +1226,6 @@ static void simulate_cycle(void) {
                 core->stall_mem = true;
                 core->stall_decode = true;
                 core->stall_fetch = true;
-                core->stats.mem_stall++;
                 continue;
             }
         }
@@ -1253,6 +1310,7 @@ static void simulate_cycle(void) {
         core->ex_mem = saved_id_ex[i];
         core->ex_mem.alu_result = result;
         core->ex_mem.mem_addr = (uint32_t)result & 0x1FFFFF;  // Mask to 21 bits
+        core->ex_mem.cache_op_done = false;  /* Reset flag for new instruction */
         core->id_ex.valid = false;
     }
     
@@ -1382,6 +1440,7 @@ static void simulate_cycle(void) {
         core->id_ex.valid = true;
         core->id_ex.writes_reg = writes_register(inst->opcode);
         core->id_ex.dest_reg = get_dest_reg(inst);
+        core->id_ex.cache_op_done = false;  /* Initialize flag */
         
         core->if_id.valid = false;
     }
@@ -1403,6 +1462,7 @@ static void simulate_cycle(void) {
         core->if_id.inst = decode_instruction(raw);
         core->if_id.pc = core->pc;
         core->if_id.valid = true;
+        core->if_id.cache_op_done = false;  /* Initialize flag */
         
         /* Increment PC - delay slot instruction will be fetched next */
         core->pc = (core->pc + 1) & 0x3FF;
@@ -1419,14 +1479,10 @@ static void simulate_cycle(void) {
         }
     }
     
-    /* Update cycle counts */
+    /* Update cycle counts - count this cycle if core was active (wrote trace) */
     for (int i = 0; i < NUM_CORES; i++) {
-        Core *core = &g_cores[i];
-        // Check if core is still active (running or draining pipeline)
-        bool active = !core->halted || core->if_id.valid || core->id_ex.valid ||
-                      core->ex_mem.valid || core->mem_wb.valid;
-        if (active) {
-            core->stats.cycles = g_cycle + 1;
+        if (core_was_active[i]) {
+            g_cores[i].stats.cycles = g_cycle + 1;
         }
     }
     
@@ -1501,7 +1557,7 @@ int main(int argc, char *argv[]) {
     g_bus_trace = fopen(bustrace_file, "w");
     
     /* Run simulation until all cores halt and pipelines drain */
-    g_cycle = 0;
+    g_cycle = 0;  /* Cycles start at 0 per spec */
     while (!all_cores_done()) {
         simulate_cycle();
         
